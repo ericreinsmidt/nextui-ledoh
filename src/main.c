@@ -1,0 +1,1505 @@
+/*
+ * LED'oh! — LED color controller for NextUI
+ * Apostrophe UI + PakKit. No network required.
+ *
+ * Graphical front/back device view with selectable LED zones.
+ * RGB color picker with live sysfs preview.
+ * Saves to NextUI-compatible ledsettings file.
+ */
+
+#define AP_IMPLEMENTATION
+#include "apostrophe.h"
+
+#define PAKKIT_UI_IMPLEMENTATION
+#include "pakkit_ui.h"
+
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <errno.h>
+#include <math.h>
+
+/* -----------------------------------------------------------------------
+ * Constants
+ * ----------------------------------------------------------------------- */
+
+#define LEDOH_VERSION    "0.1.0"
+#define MAX_PATH_LEN     1280
+#define MAX_ZONES        4
+#define MAX_LINE         512
+
+#define DEFAULT_BG_R     30
+#define DEFAULT_BG_G     30
+#define DEFAULT_BG_B     35
+#define DEFAULT_TEXT_R   220
+#define DEFAULT_TEXT_G   220
+#define DEFAULT_TEXT_B   220
+#define DEFAULT_HINT_R   140
+#define DEFAULT_HINT_G   140
+#define DEFAULT_HINT_B   150
+
+#define VIEW_FRONT       0
+#define VIEW_BACK        1
+
+#define SLIDER_R         0
+#define SLIDER_G         1
+#define SLIDER_B         2
+#define SLIDER_COUNT     3
+
+/* Device image dimensions (source asset) */
+#define DEV_IMG_W        349
+#define DEV_IMG_H        532
+
+/* LED overlay positions in source image coordinates */
+/* Front: FN1 */
+#define FN1_X            132
+#define FN1_Y            302
+#define FN1_W            33
+#define FN1_H            13
+
+/* Front: FN2 */
+#define FN2_X            184
+#define FN2_Y            302
+#define FN2_W            33
+#define FN2_H            13
+
+/* Back: Top bar (m) */
+#define TOPBAR_X         87
+#define TOPBAR_Y         0
+#define TOPBAR_W         175
+#define TOPBAR_H         13
+
+/* Back: L triggers */
+#define LTRIG_X          8
+#define LTRIG_Y          222
+#define LTRIG_W          134
+#define LTRIG_H          18
+
+/* Back: R triggers (mirrored) */
+#define RTRIG_Y          222
+#define RTRIG_H          18
+
+/* Minimum effect value — effect 0 is "Off" which disables the LED entirely.
+ * Users should use brightness=0 to turn off an LED, not effect=0.
+ * We clamp to 1 (Linear Rise) as the minimum selectable effect. */
+#define EFFECT_MIN       1
+
+/* -----------------------------------------------------------------------
+ * Data structures
+ * ----------------------------------------------------------------------- */
+
+typedef struct {
+    const char *name;       /* Display name: "FN1 Key" */
+    const char *filename;   /* Sysfs zone name: "f1" */
+    int         view;       /* VIEW_FRONT or VIEW_BACK */
+    int         zone_index; /* Index within its view (for d-pad navigation) */
+} zone_def_t;
+
+typedef struct {
+    uint8_t r, g, b;
+    int     effect;
+    int     speed;
+    int     brightness;
+    int     trigger;
+    int     inbrightness;
+} zone_state_t;
+
+/* LED overlay rectangle in source image coordinates */
+typedef struct {
+    int x, y, w, h;
+    int rounded;  /* 1 = draw with rounded corners */
+} led_overlay_t;
+
+/* -----------------------------------------------------------------------
+ * Zone definitions — Brick / Brick Hammer
+ * ----------------------------------------------------------------------- */
+
+static const zone_def_t g_brick_zones[MAX_ZONES] = {
+    { "FN1 Key",      "f1", VIEW_FRONT, 0 },
+    { "FN2 Key",      "f2", VIEW_FRONT, 1 },
+    { "Top Bar",      "m",  VIEW_BACK,  0 },
+    { "L/R Triggers", "lr", VIEW_BACK,  1 },
+};
+
+/* Overlay positions per zone (source image coords) */
+static const led_overlay_t g_brick_overlays[MAX_ZONES] = {
+    { FN1_X, FN1_Y, FN1_W, FN1_H, 1 },       /* f1 */
+    { FN2_X, FN2_Y, FN2_W, FN2_H, 1 },       /* f2 */
+    { TOPBAR_X, TOPBAR_Y, TOPBAR_W, TOPBAR_H, 0 },  /* m */
+    { 0, 0, 0, 0, 0 },                         /* lr — special: two rects */
+};
+
+/* -----------------------------------------------------------------------
+ * Globals
+ * ----------------------------------------------------------------------- */
+
+static int           g_is_brick     = 1;
+static int           g_zone_count   = MAX_ZONES;
+static const zone_def_t *g_zones    = g_brick_zones;
+
+static zone_state_t  g_zone_state[MAX_ZONES];
+static zone_state_t  g_zone_saved[MAX_ZONES];   /* last-saved state for dirty check */
+static int           g_current_view = VIEW_FRONT;
+static int           g_selected_zone = 0;        /* index into g_zones[] */
+
+static char          g_settings_path[MAX_PATH_LEN] = {0};
+
+/* Device images */
+static SDL_Texture  *g_img_front = NULL;
+static SDL_Texture  *g_img_back  = NULL;
+
+/* Pulse animation */
+static Uint32        g_pulse_start = 0;
+
+/* -----------------------------------------------------------------------
+ * String helpers
+ * ----------------------------------------------------------------------- */
+
+static void trim_inplace(char *s) {
+    char *start = s;
+    while (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n')
+        start++;
+    if (start != s)
+        memmove(s, start, strlen(start) + 1);
+    size_t len = strlen(s);
+    while (len > 0 && (s[len - 1] == ' ' || s[len - 1] == '\t' ||
+                       s[len - 1] == '\r' || s[len - 1] == '\n')) {
+        s[--len] = '\0';
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * Sysfs helpers — write LED state to hardware
+ * ----------------------------------------------------------------------- */
+
+static void sysfs_write(const char *path, const char *value) {
+    ap_log("SYSFS WRITE: %s = \"%s\"", path, value);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        ap_log("SYSFS ERROR: failed to open %s: %s", path, strerror(errno));
+        return;
+    }
+    if (fprintf(f, "%s\n", value) < 0) {
+        ap_log("SYSFS ERROR: fprintf failed for %s: %s", path, strerror(errno));
+    }
+    fclose(f);
+}
+
+static void sysfs_write_int(const char *path, int value) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%d", value);
+    sysfs_write(path, buf);
+}
+
+static void led_write_color(const char *filename, uint8_t r, uint8_t g, uint8_t b) {
+    char path[256];
+    snprintf(path, sizeof(path), "/sys/class/led_anim/effect_rgb_hex_%s", filename);
+    char hex[16];
+    snprintf(hex, sizeof(hex), "%02X%02X%02X", r, g, b);
+    ap_log("LED COLOR [%s]: #%s", filename, hex);
+    sysfs_write(path, hex);
+}
+
+static void led_write_effect(const char *filename, int effect) {
+    char path[256];
+    snprintf(path, sizeof(path), "/sys/class/led_anim/effect_%s", filename);
+    ap_log("LED EFFECT [%s]: %d", filename, effect);
+    sysfs_write_int(path, effect);
+}
+
+static void led_write_brightness(const char *filename, int brightness) {
+    char path[256];
+    if (g_is_brick) {
+        if (strcmp(filename, "m") == 0)
+            snprintf(path, sizeof(path), "/sys/class/led_anim/max_scale");
+        else if (strcmp(filename, "f1") == 0 || strcmp(filename, "f2") == 0)
+            snprintf(path, sizeof(path), "/sys/class/led_anim/max_scale_f1f2");
+        else if (strcmp(filename, "lr") == 0)
+            snprintf(path, sizeof(path), "/sys/class/led_anim/max_scale_lr");
+        else
+            snprintf(path, sizeof(path), "/sys/class/led_anim/max_scale_%s", filename);
+    } else {
+        snprintf(path, sizeof(path), "/sys/class/led_anim/max_scale");
+    }
+    ap_log("LED BRIGHTNESS [%s]: %d (path: %s)", filename, brightness, path);
+    sysfs_write_int(path, brightness);
+}
+
+static void led_write_speed(const char *filename, int speed) {
+    char path[256];
+    snprintf(path, sizeof(path), "/sys/class/led_anim/effect_duration_%s", filename);
+    ap_log("LED SPEED [%s]: %d", filename, speed);
+    sysfs_write_int(path, speed);
+}
+
+static void led_write_cycles(const char *filename, int cycles) {
+    char path[256];
+    snprintf(path, sizeof(path), "/sys/class/led_anim/effect_cycles_%s", filename);
+    ap_log("LED CYCLES [%s]: %d", filename, cycles);
+    sysfs_write_int(path, cycles);
+}
+
+static void led_apply_zone(int zone_idx) {
+    const zone_def_t *zd = &g_zones[zone_idx];
+    zone_state_t *zs = &g_zone_state[zone_idx];
+
+    ap_log("LED APPLY ZONE [%d/%s]: r=%d g=%d b=%d effect=%d brightness=%d speed=%d",
+           zone_idx, zd->filename, zs->r, zs->g, zs->b,
+           zs->effect, zs->brightness, zs->speed);
+
+    led_write_color(zd->filename, zs->r, zs->g, zs->b);
+    led_write_effect(zd->filename, zs->effect);
+    led_write_brightness(zd->filename, zs->brightness);
+    led_write_speed(zd->filename, zs->speed);
+    led_write_cycles(zd->filename, -1);
+}
+
+static void led_apply_color_only(int zone_idx) {
+    const zone_def_t *zd = &g_zones[zone_idx];
+    zone_state_t *zs = &g_zone_state[zone_idx];
+    ap_log("LED COLOR ONLY [%d/%s]: r=%d g=%d b=%d", zone_idx, zd->filename, zs->r, zs->g, zs->b);
+    led_write_color(zd->filename, zs->r, zs->g, zs->b);
+    /* Hardware requires an effect write to latch the new color.
+     * The color picker forces static (4) on entry, so re-writing
+     * effect=4 here is safe — static has no animation to re-trigger. */
+    led_write_effect(zd->filename, 4);
+}
+
+/* Restore the saved (on-disk) LED state to hardware on exit */
+static void led_restore_saved_state(void) {
+    ap_log("LED RESTORE: restoring saved state to hardware (%d zones)", g_zone_count);
+    for (int i = 0; i < g_zone_count; i++) {
+        const zone_def_t *zd = &g_zones[i];
+        zone_state_t *zs = &g_zone_saved[i];
+
+        ap_log("LED RESTORE [%d/%s]: r=%d g=%d b=%d effect=%d brightness=%d speed=%d",
+               i, zd->filename, zs->r, zs->g, zs->b,
+               zs->effect, zs->brightness, zs->speed);
+
+        led_write_color(zd->filename, zs->r, zs->g, zs->b);
+        led_write_effect(zd->filename, zs->effect);
+        led_write_brightness(zd->filename, zs->brightness);
+        led_write_speed(zd->filename, zs->speed);
+        led_write_cycles(zd->filename, -1);
+    }
+    ap_log("LED RESTORE: done");
+}
+
+/* -----------------------------------------------------------------------
+ * Settings file: load / save (NextUI-compatible INI format)
+ * ----------------------------------------------------------------------- */
+
+static void set_defaults(void) {
+    ap_log("SETTINGS: setting defaults for %d zones", g_zone_count);
+    for (int i = 0; i < g_zone_count; i++) {
+        g_zone_state[i] = (zone_state_t){
+            .r = 255, .g = 255, .b = 255,
+            .effect = 4,
+            .speed = 1000,
+            .brightness = 100,
+            .trigger = 1,
+            .inbrightness = 100,
+        };
+    }
+}
+
+static int find_zone_by_section(const char *section) {
+    for (int i = 0; i < g_zone_count; i++) {
+        if (strcmp(g_zones[i].filename, section) == 0)
+            return i;
+    }
+    return -1;
+}
+
+static void parse_color(const char *val, uint8_t *r, uint8_t *g, uint8_t *b) {
+    unsigned int color = 0;
+    if (val[0] == '0' && (val[1] == 'x' || val[1] == 'X'))
+        sscanf(val + 2, "%x", &color);
+    else
+        sscanf(val, "%x", &color);
+    *r = (color >> 16) & 0xFF;
+    *g = (color >> 8) & 0xFF;
+    *b = color & 0xFF;
+}
+
+static void load_settings(void) {
+    set_defaults();
+
+    if (g_settings_path[0] == '\0') return;
+
+    FILE *f = fopen(g_settings_path, "r");
+    if (!f) {
+        ap_log("settings: file not found at %s, using defaults", g_settings_path);
+        return;
+    }
+
+    char line[MAX_LINE];
+    int current_zone = -1;
+
+    while (fgets(line, sizeof(line), f)) {
+        trim_inplace(line);
+        if (line[0] == '\0' || line[0] == '#') continue;
+
+        /* Section header */
+        if (line[0] == '[') {
+            char section[64] = {0};
+            if (sscanf(line, "[%63[^]]]", section) == 1) {
+                current_zone = find_zone_by_section(section);
+                ap_log("SETTINGS: parsing section [%s] → zone_idx=%d", section, current_zone);
+            }
+            continue;
+        }
+
+        if (current_zone < 0) continue;
+
+        zone_state_t *zs = &g_zone_state[current_zone];
+        char key[MAX_LINE] = {0}, val[MAX_LINE] = {0};
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        snprintf(key, sizeof(key), "%s", line);
+        snprintf(val, sizeof(val), "%s", eq + 1);
+        trim_inplace(key);
+        trim_inplace(val);
+
+        if (strcmp(key, "color1") == 0) {
+            parse_color(val, &zs->r, &zs->g, &zs->b);
+        } else if (strcmp(key, "effect") == 0) {
+            zs->effect = atoi(val);
+            /* Clamp effect: 0 means "Off" which disables the LED.
+             * If we load effect=0 from a file (e.g. written by another tool),
+             * upgrade it to 4 (Static) so the LED is visible. */
+            if (zs->effect < EFFECT_MIN) {
+                ap_log("SETTINGS: zone %d effect=%d is below minimum, upgrading to 4 (Static)",
+                       current_zone, zs->effect);
+                zs->effect = 4;
+            }
+        } else if (strcmp(key, "speed") == 0) {
+            zs->speed = atoi(val);
+        } else if (strcmp(key, "brightness") == 0) {
+            zs->brightness = atoi(val);
+        } else if (strcmp(key, "trigger") == 0) {
+            zs->trigger = atoi(val);
+        } else if (strcmp(key, "inbrightness") == 0) {
+            zs->inbrightness = atoi(val);
+        }
+    }
+
+    fclose(f);
+
+    /* Log loaded state */
+    for (int i = 0; i < g_zone_count; i++) {
+        zone_state_t *zs = &g_zone_state[i];
+        ap_log("SETTINGS LOADED [%d/%s]: r=%d g=%d b=%d effect=%d brightness=%d speed=%d trigger=%d inbrightness=%d",
+               i, g_zones[i].filename, zs->r, zs->g, zs->b,
+               zs->effect, zs->brightness, zs->speed, zs->trigger, zs->inbrightness);
+    }
+
+    ap_log("SETTINGS: loaded from %s, saved state snapshot taken", g_settings_path);
+
+    /* Copy to saved state for dirty tracking */
+    memcpy(g_zone_saved, g_zone_state, sizeof(g_zone_saved));
+}
+
+static void save_settings(void) {
+    if (g_settings_path[0] == '\0') return;
+
+    /* Ensure parent directory exists */
+    char dir[MAX_PATH_LEN];
+    snprintf(dir, sizeof(dir), "%s", g_settings_path);
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+        *slash = '\0';
+        mkdir(dir, 0755);
+    }
+
+    FILE *f = fopen(g_settings_path, "w");
+    if (!f) {
+        ap_log("settings: failed to save to %s: %s", g_settings_path, strerror(errno));
+        return;
+    }
+
+    for (int i = 0; i < g_zone_count; i++) {
+        const zone_def_t *zd = &g_zones[i];
+        zone_state_t *zs = &g_zone_state[i];
+        uint32_t color = ((uint32_t)zs->r << 16) | ((uint32_t)zs->g << 8) | zs->b;
+
+        ap_log("SETTINGS SAVED [%d/%s]: r=%d g=%d b=%d effect=%d brightness=%d speed=%d",
+               i, zd->filename, zs->r, zs->g, zs->b, zs->effect, zs->brightness, zs->speed);
+
+        fprintf(f, "[%s]\n", zd->filename);
+        fprintf(f, "effect=%d\n", zs->effect);
+        fprintf(f, "color1=0x%06X\n", color);
+        fprintf(f, "color2=0x%06X\n", color);
+        fprintf(f, "speed=%d\n", zs->speed);
+        fprintf(f, "brightness=%d\n", zs->brightness);
+        fprintf(f, "trigger=%d\n", zs->trigger);
+        fprintf(f, "filename=%s\n", zd->filename);
+        fprintf(f, "inbrightness=%d\n", zs->inbrightness);
+        fprintf(f, "\n");
+    }
+
+    fclose(f);
+    memcpy(g_zone_saved, g_zone_state, sizeof(g_zone_saved));
+    ap_log("SETTINGS: saved to %s", g_settings_path);
+}
+
+static int is_dirty(void) {
+    return memcmp(g_zone_state, g_zone_saved, sizeof(g_zone_state)) != 0;
+}
+
+/* -----------------------------------------------------------------------
+ * Device image loading
+ * ----------------------------------------------------------------------- */
+
+static void load_device_images(void) {
+    const char *pak_dir = getenv("LEDOH_PAK_DIR");
+    char path[MAX_PATH_LEN];
+
+    if (pak_dir) {
+        snprintf(path, sizeof(path), "%s/res/front.png", pak_dir);
+    } else {
+        snprintf(path, sizeof(path), "res/front.png");
+    }
+    g_img_front = ap_load_image(path);
+    if (g_img_front)
+        ap_log("loaded front image: %s", path);
+    else
+        ap_log("WARNING: could not load front image: %s", path);
+
+    if (pak_dir) {
+        snprintf(path, sizeof(path), "%s/res/back.png", pak_dir);
+    } else {
+        snprintf(path, sizeof(path), "res/back.png");
+    }
+    g_img_back = ap_load_image(path);
+    if (g_img_back)
+        ap_log("loaded back image: %s", path);
+    else
+        ap_log("WARNING: could not load back image: %s", path);
+}
+
+/* -----------------------------------------------------------------------
+ * Scaled overlay drawing helpers
+ * ----------------------------------------------------------------------- */
+
+/* Calculate device image draw rect (centered on screen, scaled to fit) */
+static void calc_device_rect(int content_y, int content_h,
+                              int *out_x, int *out_y, int *out_w, int *out_h,
+                              float *out_scale) {
+    int sw = ap_get_screen_width();
+    int pad = AP_DS(5);
+
+    /* Leave some margin */
+    int max_w = sw - pad * 8;
+    int max_h = content_h - pad * 4;
+
+    float scale_w = (float)max_w / (float)DEV_IMG_W;
+    float scale_h = (float)max_h / (float)DEV_IMG_H;
+    float scale = (scale_w < scale_h) ? scale_w : scale_h;
+    if (scale > 2.0f) scale = 2.0f;  /* cap scaling */
+
+    int draw_w = (int)(DEV_IMG_W * scale);
+    int draw_h = (int)(DEV_IMG_H * scale);
+    int draw_x = (sw - draw_w) / 2;
+    int draw_y = content_y + (content_h - draw_h) / 2;
+
+    *out_x = draw_x;
+    *out_y = draw_y;
+    *out_w = draw_w;
+    *out_h = draw_h;
+    *out_scale = scale;
+}
+
+/* Get pulsing alpha for selection border (0.4 to 1.0 range) */
+static uint8_t get_pulse_alpha(void) {
+    Uint32 now = SDL_GetTicks();
+    Uint32 elapsed = now - g_pulse_start;
+    /* 1.5 second cycle */
+    float t = (float)(elapsed % 1500) / 1500.0f;
+    float pulse = 0.4f + 0.6f * (0.5f + 0.5f * sinf(t * 2.0f * 3.14159f));
+    return (uint8_t)(pulse * 255.0f);
+}
+
+/* Draw a filled rect with alpha using SDL */
+static void draw_rect_alpha(int x, int y, int w, int h,
+                             uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    SDL_SetRenderDrawBlendMode(ap__g.renderer, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(ap__g.renderer, r, g, b, a);
+    SDL_Rect rect = { x, y, w, h };
+    SDL_RenderFillRect(ap__g.renderer, &rect);
+}
+
+/* Draw a selection border (outline) around a rect */
+static void draw_selection_border(int x, int y, int w, int h,
+                                   uint8_t alpha, int thickness) {
+    /* Top */
+    draw_rect_alpha(x - thickness, y - thickness,
+                    w + thickness * 2, thickness,
+                    255, 255, 255, alpha);
+    /* Bottom */
+    draw_rect_alpha(x - thickness, y + h,
+                    w + thickness * 2, thickness,
+                    255, 255, 255, alpha);
+    /* Left */
+    draw_rect_alpha(x - thickness, y,
+                    thickness, h,
+                    255, 255, 255, alpha);
+    /* Right */
+    draw_rect_alpha(x + w, y,
+                    thickness, h,
+                    255, 255, 255, alpha);
+}
+
+/* Draw LED overlay for a zone at scaled position on the device image */
+static void draw_led_overlay(int zone_idx, int img_x, int img_y, float scale,
+                              int is_selected) {
+    zone_state_t *zs = &g_zone_state[zone_idx];
+    uint8_t led_alpha = 180;
+    int border_thick = (int)(2.0f * scale);
+    if (border_thick < 2) border_thick = 2;
+
+    if (zone_idx == 3) {
+        /* LR triggers — two separate rects */
+        /* Left trigger */
+        int lx = img_x + (int)(LTRIG_X * scale);
+        int ly = img_y + (int)(LTRIG_Y * scale);
+        int lw = (int)(LTRIG_W * scale);
+        int lh = (int)(LTRIG_H * scale);
+        draw_rect_alpha(lx, ly, lw, lh, zs->r, zs->g, zs->b, led_alpha);
+
+        /* Right trigger (mirrored) */
+        int rx = img_x + (int)((DEV_IMG_W - LTRIG_W - 8) * scale);
+        int ry = ly;
+        int rw = lw;
+        int rh = lh;
+        draw_rect_alpha(rx, ry, rw, rh, zs->r, zs->g, zs->b, led_alpha);
+
+        if (is_selected) {
+            uint8_t pulse_a = get_pulse_alpha();
+            draw_selection_border(lx, ly, lw, lh, pulse_a, border_thick);
+            draw_selection_border(rx, ry, rw, rh, pulse_a, border_thick);
+        }
+    } else {
+        const led_overlay_t *ov = &g_brick_overlays[zone_idx];
+        int ox = img_x + (int)(ov->x * scale);
+        int oy = img_y + (int)(ov->y * scale);
+        int ow = (int)(ov->w * scale);
+        int oh = (int)(ov->h * scale);
+
+        if (ov->rounded) {
+            /* Draw rounded pill for FN buttons */
+            ap_color c = { zs->r, zs->g, zs->b, led_alpha };
+            ap_draw_pill(ox, oy, ow, oh, c);
+        } else {
+            draw_rect_alpha(ox, oy, ow, oh, zs->r, zs->g, zs->b, led_alpha);
+        }
+
+        if (is_selected) {
+            uint8_t pulse_a = get_pulse_alpha();
+            draw_selection_border(ox, oy, ow, oh, pulse_a, border_thick);
+        }
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * Navigation helpers
+ * ----------------------------------------------------------------------- */
+
+/* Get first zone index in the given view */
+static int first_zone_in_view(int view) {
+    for (int i = 0; i < g_zone_count; i++) {
+        if (g_zones[i].view == view) return i;
+    }
+    return 0;
+}
+
+
+/* -----------------------------------------------------------------------
+ * Effect names
+ * ----------------------------------------------------------------------- */
+
+#define EFFECT_COUNT 8
+
+static const char *g_effect_names[EFFECT_COUNT] = {
+    "Off",
+    "Linear Rise",
+    "Breathe",
+    "Sniff",
+    "Static",
+    "Blink 1",
+    "Blink 2",
+    "Blink 3",
+};
+
+/* -----------------------------------------------------------------------
+ * Zone settings screen (brightness, effect, speed)
+ * ----------------------------------------------------------------------- */
+
+#define ZS_ROW_BRIGHTNESS  0
+#define ZS_ROW_EFFECT      1
+#define ZS_ROW_SPEED       2
+#define ZS_ROW_COUNT       3
+
+static void show_zone_settings(int zone_idx) {
+    zone_state_t *zs = &g_zone_state[zone_idx];
+    const zone_def_t *zd = &g_zones[zone_idx];
+
+    /* Save originals in case user cancels */
+    int orig_brightness = zs->brightness;
+    int orig_effect = zs->effect;
+    int orig_speed = zs->speed;
+
+    ap_log("ZONE SETTINGS: entering for zone %d/%s (brightness=%d effect=%d speed=%d)",
+           zone_idx, zd->filename, zs->brightness, zs->effect, zs->speed);
+
+    int active_row = ZS_ROW_BRIGHTNESS;
+    int running = 1;
+    int l1_held = 0, r1_held = 0;
+
+    while (running) {
+        ap_input_event ev;
+        while (ap_poll_input(&ev)) {
+            if (ev.button == AP_BTN_L1) l1_held = ev.pressed;
+            if (ev.button == AP_BTN_R1) r1_held = ev.pressed;
+
+            if (ev.pressed) {
+                switch (ev.button) {
+                    case AP_BTN_B:
+                        if (!ev.repeated) {
+                            /* Cancel — restore originals */
+                            ap_log("ZONE SETTINGS: cancelled, restoring originals");
+                            zs->brightness = orig_brightness;
+                            zs->effect = orig_effect;
+                            zs->speed = orig_speed;
+                            led_apply_zone(zone_idx);
+                            running = 0;
+                        }
+                        break;
+                    case AP_BTN_A:
+                        if (!ev.repeated) {
+                            /* Confirm */
+                            ap_log("ZONE SETTINGS: confirmed (brightness=%d effect=%d speed=%d)",
+                                   zs->brightness, zs->effect, zs->speed);
+                            running = 0;
+                        }
+                        break;
+                    case AP_BTN_UP:
+                        if (!ev.repeated) {
+                            active_row--;
+                            if (active_row < 0) active_row = ZS_ROW_COUNT - 1;
+                        }
+                        break;
+                    case AP_BTN_DOWN:
+                        if (!ev.repeated) {
+                            active_row++;
+                            if (active_row >= ZS_ROW_COUNT) active_row = 0;
+                        }
+                        break;
+                    case AP_BTN_LEFT:
+                    case AP_BTN_RIGHT: {
+                        int dir = (ev.button == AP_BTN_RIGHT) ? 1 : -1;
+                        int step = (l1_held || r1_held) ? 10 : 1;
+                        switch (active_row) {
+                            case ZS_ROW_BRIGHTNESS: {
+                                int v = zs->brightness + dir * step;
+                                if (v < 0) v = 0;
+                                if (v > 100) v = 100;
+                                zs->brightness = v;
+                                led_write_brightness(zd->filename, zs->brightness);
+                                /* f1 and f2 share brightness — sync them */
+                                if (strcmp(zd->filename, "f1") == 0)
+                                    g_zone_state[1].brightness = v;
+                                else if (strcmp(zd->filename, "f2") == 0)
+                                    g_zone_state[0].brightness = v;
+                                break;
+                            }
+                            case ZS_ROW_EFFECT: {
+                                int v = zs->effect + dir;
+                                /* Wrap within EFFECT_MIN..EFFECT_COUNT-1 range.
+                                 * Effect 0 ("Off") is not selectable — use brightness=0 instead. */
+                                if (v < EFFECT_MIN) v = EFFECT_COUNT - 1;
+                                if (v >= EFFECT_COUNT) v = EFFECT_MIN;
+                                zs->effect = v;
+                                ap_log("ZONE SETTINGS: effect changed to %d (%s)",
+                                       zs->effect, g_effect_names[zs->effect]);
+                                led_write_effect(zd->filename, zs->effect);
+                                led_write_cycles(zd->filename, -1);
+                                break;
+                            }
+                            case ZS_ROW_SPEED: {
+                                int s = (l1_held || r1_held) ? 500 : 100;
+                                int v = zs->speed + dir * s;
+                                if (v < 100) v = 100;
+                                if (v > 10000) v = 10000;
+                                zs->speed = v;
+                                led_write_speed(zd->filename, zs->speed);
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                    case AP_BTN_L1:
+                    case AP_BTN_R1:
+                        /* Handled via held state */
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+
+        /* Draw */
+        ap_clear_screen();
+        ap_draw_background();
+
+        int sw = ap_get_screen_width();
+        int pad = AP_DS(5);
+
+        TTF_Font *font_med   = ap_get_font(AP_FONT_MEDIUM);
+        TTF_Font *font_small = ap_get_font(AP_FONT_SMALL);
+
+        ap_theme *theme = ap_get_theme();
+        ap_color text_color = theme->text;
+        ap_color hint_color = theme->hint;
+        ap_color highlight  = theme->highlight;
+        ap_color hl_text    = theme->highlighted_text;
+
+        int y = pad * 3;
+
+        /* Title */
+        char title[128];
+        snprintf(title, sizeof(title), "%s Settings", zd->name);
+        ap_draw_text(font_med, title, pad * 3, y, text_color);
+        y += TTF_FontHeight(font_med) + pad * 2;
+
+        /* Divider */
+        ap_draw_rect(pad * 3, y, sw - pad * 6, 1, hint_color);
+        y += pad * 4;
+
+        /* Color preview */
+        int swatch_size = TTF_FontHeight(font_med);
+        ap_color swatch_c = { zs->r, zs->g, zs->b, 255 };
+        ap_draw_rect(pad * 3, y, swatch_size, swatch_size, swatch_c);
+        char hex_str[16];
+        snprintf(hex_str, sizeof(hex_str), "#%02X%02X%02X", zs->r, zs->g, zs->b);
+        ap_draw_text(font_small, hex_str, pad * 3 + swatch_size + pad * 2,
+                     y + (swatch_size - TTF_FontHeight(font_small)) / 2, hint_color);
+        y += swatch_size + pad * 4;
+
+        /* Settings rows */
+        int row_h = TTF_FontHeight(font_small) + pad * 4;
+        int label_x = pad * 4;
+        int value_x = sw / 2;
+
+        for (int r = 0; r < ZS_ROW_COUNT; r++) {
+            int ry = y + r * row_h;
+            int is_active = (r == active_row);
+            const char *label = "";
+            char value_str[64] = {0};
+
+            switch (r) {
+                case ZS_ROW_BRIGHTNESS:
+                    label = "Brightness";
+                    snprintf(value_str, sizeof(value_str), "%d%%", zs->brightness);
+                    break;
+                case ZS_ROW_EFFECT:
+                    label = "Effect";
+                    if (zs->effect >= 0 && zs->effect < EFFECT_COUNT)
+                        snprintf(value_str, sizeof(value_str), "< %s >", g_effect_names[zs->effect]);
+                    else
+                        snprintf(value_str, sizeof(value_str), "< %d >", zs->effect);
+                    break;
+                case ZS_ROW_SPEED:
+                    label = "Speed";
+                    if (zs->speed >= 1000)
+                        snprintf(value_str, sizeof(value_str), "%.1fs", zs->speed / 1000.0f);
+                    else
+                        snprintf(value_str, sizeof(value_str), "%dms", zs->speed);
+                    break;
+            }
+
+            if (is_active) {
+                ap_draw_pill(pad * 2, ry, sw - pad * 4, row_h, highlight);
+                ap_draw_text(font_small, label, label_x, ry + (row_h - TTF_FontHeight(font_small)) / 2, hl_text);
+                ap_draw_text(font_small, value_str, value_x, ry + (row_h - TTF_FontHeight(font_small)) / 2, hl_text);
+            } else {
+                ap_draw_text(font_small, label, label_x, ry + (row_h - TTF_FontHeight(font_small)) / 2, text_color);
+                ap_draw_text(font_small, value_str, value_x, ry + (row_h - TTF_FontHeight(font_small)) / 2, hint_color);
+            }
+
+            /* Brightness bar */
+            if (r == ZS_ROW_BRIGHTNESS) {
+                int bar_x = value_x;
+                int bar_w = sw - bar_x - pad * 4;
+                int bar_h = 6;
+                int bar_y_pos = ry + row_h - bar_h - pad;
+                ap_color bar_bg = { 60, 60, 65, 255 };
+                ap_draw_rect(bar_x, bar_y_pos, bar_w, bar_h, bar_bg);
+                int fill_w = (zs->brightness * bar_w) / 100;
+                ap_color bar_fill = is_active ? hl_text : text_color;
+                ap_draw_rect(bar_x, bar_y_pos, fill_w, bar_h, bar_fill);
+            }
+        }
+
+        /* Hints */
+        pakkit_hint hints[] = {
+            { .button = "B", .label = "Cancel" },
+            { .button = "L/R", .label = "Adjust" },
+            { .button = "L1+L/R", .label = "Fast" },
+            { .button = "A", .label = "Confirm" },
+        };
+        pakkit_draw_hints(hints, 4);
+
+        ap_present();
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * HSL to RGB conversion
+ * ----------------------------------------------------------------------- */
+
+static float hsl_hue2rgb(float p, float q, float t) {
+    if (t < 0.0f) t += 1.0f;
+    if (t > 1.0f) t -= 1.0f;
+    if (t < 1.0f / 6.0f) return p + (q - p) * 6.0f * t;
+    if (t < 1.0f / 2.0f) return q;
+    if (t < 2.0f / 3.0f) return p + (q - p) * (2.0f / 3.0f - t) * 6.0f;
+    return p;
+}
+
+static void hsl_to_rgb(float h, float s, float l,
+                        uint8_t *r, uint8_t *g, uint8_t *b) {
+    if (s <= 0.0f) {
+        uint8_t v = (uint8_t)(l * 255.0f);
+        *r = *g = *b = v;
+        return;
+    }
+    float q = (l < 0.5f) ? (l * (1.0f + s)) : (l + s - l * s);
+    float p = 2.0f * l - q;
+    float rf = hsl_hue2rgb(p, q, h + 1.0f / 3.0f);
+    float gf = hsl_hue2rgb(p, q, h);
+    float bf = hsl_hue2rgb(p, q, h - 1.0f / 3.0f);
+    *r = (uint8_t)(rf * 255.0f);
+    *g = (uint8_t)(gf * 255.0f);
+    *b = (uint8_t)(bf * 255.0f);
+}
+
+static void rgb_to_hsl(uint8_t r, uint8_t g, uint8_t b,
+                        float *h, float *s, float *l) {
+    float rf = r / 255.0f, gf = g / 255.0f, bf = b / 255.0f;
+    float max = rf > gf ? (rf > bf ? rf : bf) : (gf > bf ? gf : bf);
+    float min = rf < gf ? (rf < bf ? rf : bf) : (gf < bf ? gf : bf);
+    float d = max - min;
+    *l = (max + min) / 2.0f;
+    if (d < 0.001f) {
+        *h = 0.0f;
+        *s = 0.0f;
+        return;
+    }
+    *s = (*l > 0.5f) ? (d / (2.0f - max - min)) : (d / (max + min));
+    if (max == rf) {
+        *h = (gf - bf) / d + (gf < bf ? 6.0f : 0.0f);
+    } else if (max == gf) {
+        *h = (bf - rf) / d + 2.0f;
+    } else {
+        *h = (rf - gf) / d + 4.0f;
+    }
+    *h /= 6.0f;
+}
+
+/* -----------------------------------------------------------------------
+ * Color picker screen
+ * ----------------------------------------------------------------------- */
+
+static void show_color_picker(int zone_idx) {
+    zone_state_t *zs = &g_zone_state[zone_idx];
+    const zone_def_t *zd = &g_zones[zone_idx];
+
+    /* Save original color in case user cancels */
+    uint8_t orig_r = zs->r, orig_g = zs->g, orig_b = zs->b;
+
+    ap_log("COLOR PICKER: entering for zone %d/%s (r=%d g=%d b=%d, effect=%d)",
+           zone_idx, zd->filename, zs->r, zs->g, zs->b, zs->effect);
+
+    /* Force static effect during color picking so color is visible */
+    ap_log("COLOR PICKER: forcing effect=4 (static) and brightness=%d for zone %s",
+           zs->brightness > 0 ? zs->brightness : 100, zd->filename);
+    led_write_effect(zd->filename, 4);
+    led_write_brightness(zd->filename, zs->brightness > 0 ? zs->brightness : 100);
+
+    /* Convert current color to HSL to find initial cursor position */
+    float init_h, init_s, init_l;
+    rgb_to_hsl(zs->r, zs->g, zs->b, &init_h, &init_s, &init_l);
+    ap_log("COLOR PICKER: initial HSL: h=%.3f s=%.3f l=%.3f", init_h, init_s, init_l);
+
+    int sw = ap_get_screen_width();
+    int sh = ap_get_screen_height();
+    int pad = AP_DS(5);
+
+    TTF_Font *font_med   = ap_get_font(AP_FONT_MEDIUM);
+    TTF_Font *font_tiny  = ap_get_font(AP_FONT_TINY);
+
+    int hint_h = TTF_FontHeight(font_tiny) + pad * 2;
+    int header_h = TTF_FontHeight(font_med) + pad * 2 + 1 + pad * 2;
+
+    /* Color field dimensions */
+    int field_x = pad * 2;
+    int field_y = pad + header_h;
+    int field_w = sw - pad * 4;
+    int field_h = sh - field_y - hint_h - pad;
+
+    /* Cursor position in field coordinates (0 to field_w-1, 0 to field_h-1) */
+    /* X = hue, Y: top=white(L=1), middle=saturated(L=0.5), bottom=black(L=0) */
+    int cursor_x = (int)(init_h * (field_w - 1));
+    int cursor_y;
+    if (init_l >= 0.5f) {
+        /* Map L 1.0..0.5 to Y 0..field_h/2 */
+        cursor_y = (int)((1.0f - init_l) * 2.0f * (field_h / 2));
+    } else {
+        /* Map L 0.5..0.0 to Y field_h/2..field_h */
+        cursor_y = field_h / 2 + (int)((0.5f - init_l) * 2.0f * (field_h / 2));
+    }
+    if (cursor_x < 0) cursor_x = 0;
+    if (cursor_x >= field_w) cursor_x = field_w - 1;
+    if (cursor_y < 0) cursor_y = 0;
+    if (cursor_y >= field_h) cursor_y = field_h - 1;
+
+    /* Build the color field texture */
+    SDL_Texture *field_tex = SDL_CreateTexture(ap__g.renderer,
+        SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING, field_w, field_h);
+
+    int running = 1;
+    int field_dirty = 1;  /* rebuild texture on first frame */
+    int cursor_speed = 2;
+    int move_count = 0;
+
+    while (running) {
+        ap_input_event ev;
+        while (ap_poll_input(&ev)) {
+            if (ev.pressed) {
+                switch (ev.button) {
+                    case AP_BTN_B:
+                        if (!ev.repeated) {
+                            ap_log("COLOR PICKER: cancelled, restoring original color #%02X%02X%02X",
+                                   orig_r, orig_g, orig_b);
+                            zs->r = orig_r;
+                            zs->g = orig_g;
+                            zs->b = orig_b;
+                            led_apply_color_only(zone_idx);
+                            running = 0;
+                        }
+                        break;
+                    case AP_BTN_A:
+                        if (!ev.repeated) {
+                            /* If the zone's effect was Off (0), upgrade to Static (4)
+                             * so the picked color is actually visible */
+                            if (zs->effect < EFFECT_MIN) {
+                                ap_log("COLOR PICKER: effect was %d (Off), upgrading to 4 (Static)",
+                                       zs->effect);
+                                zs->effect = 4;
+                            }
+                            ap_log("COLOR PICKER: confirmed color #%02X%02X%02X",
+                                   zs->r, zs->g, zs->b);
+                            running = 0;
+                        }
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+
+        /* Check d-pad held state via SDL for smooth diagonal movement */
+        const Uint8 *keys = SDL_GetKeyboardState(NULL);
+        int dx = 0, dy = 0;
+
+        /* Use SDL joystick hat or gamecontroller for d-pad on device */
+        {
+            int num_joy = SDL_NumJoysticks();
+            if (num_joy > 0) {
+                SDL_Joystick *joy = SDL_JoystickOpen(0);
+                if (joy) {
+                    Sint16 ax = SDL_JoystickGetAxis(joy, 0);  /* left stick X */
+                    Sint16 ay = SDL_JoystickGetAxis(joy, 1);  /* left stick Y */
+                    /* D-pad via hat */
+                    if (SDL_JoystickNumHats(joy) > 0) {
+                        Uint8 hat = SDL_JoystickGetHat(joy, 0);
+                        if (hat & SDL_HAT_LEFT)  dx -= cursor_speed;
+                        if (hat & SDL_HAT_RIGHT) dx += cursor_speed;
+                        if (hat & SDL_HAT_UP)    dy -= cursor_speed;
+                        if (hat & SDL_HAT_DOWN)  dy += cursor_speed;
+                    }
+                    /* Also check analog stick with deadzone */
+                    if (ax < -8000) dx -= cursor_speed;
+                    if (ax >  8000) dx += cursor_speed;
+                    if (ay < -8000) dy -= cursor_speed;
+                    if (ay >  8000) dy += cursor_speed;
+                }
+            }
+            /* Keyboard fallback for dev mode */
+            if (keys[SDL_SCANCODE_LEFT])  dx -= cursor_speed;
+            if (keys[SDL_SCANCODE_RIGHT]) dx += cursor_speed;
+            if (keys[SDL_SCANCODE_UP])    dy -= cursor_speed;
+            if (keys[SDL_SCANCODE_DOWN])  dy += cursor_speed;
+        }
+
+        if (dx != 0 || dy != 0) {
+            cursor_x += dx;
+            cursor_y += dy;
+            if (cursor_x < 0) cursor_x = 0;
+            if (cursor_x >= field_w) cursor_x = field_w - 1;
+            if (cursor_y < 0) cursor_y = 0;
+            if (cursor_y >= field_h) cursor_y = field_h - 1;
+
+            /* Convert cursor position to color */
+            float h = (float)cursor_x / (float)(field_w - 1);
+            float l;
+            int mid = field_h / 2;
+            if (cursor_y <= mid) {
+                l = 1.0f - ((float)cursor_y / (float)mid) * 0.5f;
+            } else {
+                l = 0.5f - ((float)(cursor_y - mid) / (float)(field_h - mid)) * 0.5f;
+            }
+            float s = 1.0f;
+            hsl_to_rgb(h, s, l, &zs->r, &zs->g, &zs->b);
+
+            move_count++;
+            /* Log every 30th move to keep logs manageable */
+            if (move_count % 30 == 1) {
+                ap_log("COLOR PICKER: cursor move #%d → (%d,%d) h=%.2f l=%.2f → #%02X%02X%02X",
+                       move_count, cursor_x, cursor_y, h, l, zs->r, zs->g, zs->b);
+            }
+
+            led_apply_color_only(zone_idx);
+        }
+
+        /* Build color field texture (only once, it's static) */
+        if (field_dirty && field_tex) {
+            void *pixels;
+            int pitch;
+            if (SDL_LockTexture(field_tex, NULL, &pixels, &pitch) == 0) {
+                for (int fy = 0; fy < field_h; fy++) {
+                    uint8_t *row = (uint8_t *)pixels + fy * pitch;
+                    int mid = field_h / 2;
+                    float l;
+                    if (fy <= mid) {
+                        l = 1.0f - ((float)fy / (float)mid) * 0.5f;
+                    } else {
+                        l = 0.5f - ((float)(fy - mid) / (float)(field_h - mid)) * 0.5f;
+                    }
+                    for (int fx = 0; fx < field_w; fx++) {
+                        float h = (float)fx / (float)(field_w - 1);
+                        uint8_t pr, pg, pb;
+                        hsl_to_rgb(h, 1.0f, l, &pr, &pg, &pb);
+                        row[fx * 3 + 0] = pr;
+                        row[fx * 3 + 1] = pg;
+                        row[fx * 3 + 2] = pb;
+                    }
+                }
+                SDL_UnlockTexture(field_tex);
+                field_dirty = 0;
+            }
+        }
+
+        /* Draw */
+        ap_clear_screen();
+        ap_draw_background();
+
+        ap_theme *theme = ap_get_theme();
+        ap_color text_color = theme->text;
+        ap_color hint_color = theme->hint;
+
+        /* Header: zone name + hex color */
+        int y = pad;
+        ap_draw_text(font_med, zd->name, pad * 3, y, text_color);
+        char hex_str[16];
+        snprintf(hex_str, sizeof(hex_str), "#%02X%02X%02X", zs->r, zs->g, zs->b);
+        int hex_w = ap_measure_text(font_med, hex_str);
+        ap_color preview_color = { zs->r, zs->g, zs->b, 255 };
+        ap_draw_text(font_med, hex_str, sw - hex_w - pad * 3, y, preview_color);
+        y += TTF_FontHeight(font_med) + pad;
+        ap_draw_rect(pad * 2, y, sw - pad * 4, 1, hint_color);
+        y += pad;
+
+        /* Color field */
+        if (field_tex) {
+            SDL_Rect dst = { field_x, field_y, field_w, field_h };
+            SDL_RenderCopy(ap__g.renderer, field_tex, NULL, &dst);
+        }
+
+        /* Cursor crosshair */
+        int cx = field_x + cursor_x;
+        int cy = field_y + cursor_y;
+        int cross_size = AP_DS(8);
+        int cross_thick = 2;
+
+        /* White outline for visibility on any background */
+        draw_rect_alpha(cx - cross_size - 1, cy - 1, cross_size * 2 + 3, cross_thick + 2,
+                        0, 0, 0, 180);
+        draw_rect_alpha(cx - 1, cy - cross_size - 1, cross_thick + 2, cross_size * 2 + 3,
+                        0, 0, 0, 180);
+        /* White cross */
+        draw_rect_alpha(cx - cross_size, cy, cross_size * 2 + 1, cross_thick,
+                        255, 255, 255, 255);
+        draw_rect_alpha(cx, cy - cross_size, cross_thick, cross_size * 2 + 1,
+                        255, 255, 255, 255);
+
+        /* Small color preview square next to cursor */
+        int prev_size = AP_DS(12);
+        int prev_x = cx + cross_size + pad;
+        int prev_y = cy - prev_size / 2;
+        /* Keep preview on screen */
+        if (prev_x + prev_size > sw - pad) prev_x = cx - cross_size - pad - prev_size;
+        if (prev_y < field_y) prev_y = field_y;
+        if (prev_y + prev_size > field_y + field_h) prev_y = field_y + field_h - prev_size;
+        ap_draw_rect(prev_x, prev_y, prev_size, prev_size, preview_color);
+        draw_rect_alpha(prev_x - 1, prev_y - 1, prev_size + 2, 1, 255, 255, 255, 180);
+        draw_rect_alpha(prev_x - 1, prev_y + prev_size, prev_size + 2, 1, 255, 255, 255, 180);
+        draw_rect_alpha(prev_x - 1, prev_y, 1, prev_size, 255, 255, 255, 180);
+        draw_rect_alpha(prev_x + prev_size, prev_y, 1, prev_size, 255, 255, 255, 180);
+
+        /* Hints */
+        pakkit_hint hints[] = {
+            { .button = "B", .label = "Cancel" },
+            { .button = "D-pad", .label = "Pick" },
+            { .button = "A", .label = "Confirm" },
+        };
+        pakkit_draw_hints(hints, 3);
+
+        ap_present();
+    }
+
+    if (field_tex) SDL_DestroyTexture(field_tex);
+
+    /* Re-apply full zone state (restores effect, speed, etc.) */
+    ap_log("COLOR PICKER: exiting, re-applying full zone state for zone %d/%s", zone_idx, zd->filename);
+    ap_log("COLOR PICKER: final state: r=%d g=%d b=%d effect=%d brightness=%d speed=%d",
+           zs->r, zs->g, zs->b, zs->effect, zs->brightness, zs->speed);
+    led_apply_zone(zone_idx);
+}
+
+/* -----------------------------------------------------------------------
+ * Menu screen (Y button)
+ * ----------------------------------------------------------------------- */
+
+static void show_menu(void) {
+    char zone_settings_label[128];
+    snprintf(zone_settings_label, sizeof(zone_settings_label), "%s Settings", g_zones[g_selected_zone].name);
+    pakkit_menu_item items[] = {
+        { .label = zone_settings_label },
+        { .label = "Reset This Zone" },
+        { .label = "Reset All Zones" },
+        { .label = "About" },
+    };
+    pakkit_menu_result result;
+    int rc = pakkit_menu("Menu", items, 4, &result);
+    if (rc != AP_OK) return;
+
+    switch (result.selected_index) {
+        case 0: {
+            show_zone_settings(g_selected_zone);
+            break;
+        }
+        case 1: {
+            /* Reset selected zone */
+            char msg[128];
+            snprintf(msg, sizeof(msg), "Reset %s to white?", g_zones[g_selected_zone].name);
+            if (pakkit_confirm(msg, "Reset", "Cancel")) {
+                ap_log("MENU: resetting zone %d/%s to defaults",
+                       g_selected_zone, g_zones[g_selected_zone].filename);
+                g_zone_state[g_selected_zone] = (zone_state_t){
+                    .r = 255, .g = 255, .b = 255,
+                    .effect = 4, .speed = 1000, .brightness = 100,
+                    .trigger = 1, .inbrightness = 100,
+                };
+                led_apply_zone(g_selected_zone);
+            }
+            break;
+        }
+        case 2: {
+            if (pakkit_confirm("Reset all zones to white?", "Reset All", "Cancel")) {
+                ap_log("MENU: resetting all zones to defaults");
+                set_defaults();
+                for (int i = 0; i < g_zone_count; i++)
+                    led_apply_zone(i);
+            }
+            break;
+        }
+        case 3: {
+            pakkit_info_pair info[] = {
+                { .key = "Version", .value = LEDOH_VERSION },
+                { .key = "Platform", .value = AP_PLATFORM_NAME },
+                { .key = "UI", .value = "PakKit / Apostrophe" },
+                { .key = "License", .value = "MIT" },
+            };
+            const char *credits[] = {
+                "LED'oh! by Eric Reinsmidt",
+                "Built with PakKit and Apostrophe",
+                "For NextUI by LoveRetro",
+            };
+            pakkit_detail_opts opts = {
+                .title = "LED'oh!",
+                .subtitle = "LED color controller for NextUI",
+                .info = info, .info_count = 4,
+                .credits = credits, .credit_count = 3,
+            };
+            pakkit_detail_screen(&opts);
+            break;
+        }
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * Device view screen (main screen)
+ * ----------------------------------------------------------------------- */
+
+static void show_device_view(void) {
+    int running = 1;
+    g_pulse_start = SDL_GetTicks();
+
+    while (running) {
+        ap_input_event ev;
+        while (ap_poll_input(&ev)) {
+            if (ev.pressed) {
+                switch (ev.button) {
+                    case AP_BTN_B:
+                        if (!ev.repeated) {
+                            if (is_dirty()) {
+                                ap_log("QUIT: unsaved changes detected");
+                                int choice = pakkit_confirm(
+                                    "You have unsaved changes.\nSave before quitting?",
+                                    "Save", "Discard");
+                                if (choice) {
+                                    ap_log("QUIT: user chose to save");
+                                    save_settings();
+                                }
+                            } else {
+                                ap_log("QUIT: no unsaved changes");
+                            }
+                            running = 0;
+                        }
+                        break;
+                    case AP_BTN_A:
+                        if (!ev.repeated) {
+                            show_color_picker(g_selected_zone);
+                        }
+                        break;
+                    case AP_BTN_LEFT:
+                        if (!ev.repeated && g_current_view == VIEW_FRONT) {
+                            int first = first_zone_in_view(VIEW_FRONT);
+                            if (g_selected_zone != first) {
+                                g_selected_zone = first;
+                                g_pulse_start = SDL_GetTicks();
+                            }
+                        }
+                        break;
+                    case AP_BTN_RIGHT:
+                        if (!ev.repeated && g_current_view == VIEW_FRONT) {
+                            int last = -1;
+                            for (int i = g_zone_count - 1; i >= 0; i--) {
+                                if (g_zones[i].view == VIEW_FRONT) { last = i; break; }
+                            }
+                            if (last >= 0 && g_selected_zone != last) {
+                                g_selected_zone = last;
+                                g_pulse_start = SDL_GetTicks();
+                            }
+                        }
+                        break;
+                    case AP_BTN_UP:
+                        if (!ev.repeated && g_current_view == VIEW_BACK) {
+                            int first = first_zone_in_view(VIEW_BACK);
+                            if (g_selected_zone != first) {
+                                g_selected_zone = first;
+                                g_pulse_start = SDL_GetTicks();
+                            }
+                        }
+                        break;
+                    case AP_BTN_DOWN:
+                        if (!ev.repeated && g_current_view == VIEW_BACK) {
+                            int last = -1;
+                            for (int i = g_zone_count - 1; i >= 0; i--) {
+                                if (g_zones[i].view == VIEW_BACK) { last = i; break; }
+                            }
+                            if (last >= 0 && g_selected_zone != last) {
+                                g_selected_zone = last;
+                                g_pulse_start = SDL_GetTicks();
+                            }
+                        }
+                        break;
+                    case AP_BTN_L1:
+                    case AP_BTN_R1:
+                        if (!ev.repeated) {
+                            g_current_view = (g_current_view == VIEW_FRONT) ? VIEW_BACK : VIEW_FRONT;
+                            g_selected_zone = first_zone_in_view(g_current_view);
+                            g_pulse_start = SDL_GetTicks();
+                        }
+                        break;
+                    case AP_BTN_X:
+                        if (!ev.repeated) {
+                            ap_log("QUICK SAVE: saving settings and re-applying to hardware");
+                            save_settings();
+                            for (int i = 0; i < g_zone_count; i++)
+                                led_apply_zone(i);
+                            pakkit_message("Settings saved!", "OK");
+                        }
+                        break;
+                    case AP_BTN_Y:
+                        if (!ev.repeated) {
+                            show_menu();
+                        }
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+
+        /* Draw */
+        ap_clear_screen();
+        ap_draw_background();
+
+        int sh = ap_get_screen_height();
+        int pad = AP_DS(5);
+
+        TTF_Font *font_tiny  = ap_get_font(AP_FONT_TINY);
+
+        int hint_h = TTF_FontHeight(font_tiny) + pad * 2;
+
+        /* Full screen for image: top pad to hint bar */
+        int content_y = pad;
+        int content_h = sh - content_y - hint_h - pad;
+
+        SDL_Texture *img = (g_current_view == VIEW_FRONT) ? g_img_front : g_img_back;
+
+        int img_x, img_y, img_w, img_h;
+        float img_scale;
+        calc_device_rect(content_y, content_h, &img_x, &img_y, &img_w, &img_h, &img_scale);
+
+        if (img) {
+            ap_draw_image(img, img_x, img_y, img_w, img_h);
+        } else {
+            /* Fallback: draw a placeholder rect */
+            ap_color placeholder = { 50, 50, 55, 255 };
+            ap_draw_rect(img_x, img_y, img_w, img_h, placeholder);
+        }
+
+        /* Draw LED overlays for zones in current view */
+        for (int i = 0; i < g_zone_count; i++) {
+            if (g_zones[i].view == g_current_view) {
+                draw_led_overlay(i, img_x, img_y, img_scale,
+                                 (i == g_selected_zone));
+            }
+        }
+
+        /* Hints */
+        if (g_current_view == VIEW_FRONT) {
+            pakkit_hint hints[] = {
+                { .button = "B", .label = "Quit" },
+                { .button = "L/R", .label = "Select" },
+                { .button = "L1/R1", .label = "Flip" },
+                { .button = "Y", .label = "Menu" },
+                { .button = "X", .label = "Save" },
+                { .button = "A", .label = "Edit" },
+            };
+            pakkit_draw_hints(hints, 6);
+        } else {
+            pakkit_hint hints[] = {
+                { .button = "B", .label = "Quit" },
+                { .button = "U/D", .label = "Select" },
+                { .button = "L1/R1", .label = "Flip" },
+                { .button = "Y", .label = "Menu" },
+                { .button = "X", .label = "Save" },
+                { .button = "A", .label = "Edit" },
+            };
+            pakkit_draw_hints(hints, 6);
+        }
+
+        // ap_request_frame();
+        ap_present();
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * Main
+ * ----------------------------------------------------------------------- */
+
+int main(int argc, char *argv[]) {
+    (void)argc; (void)argv;
+
+    /* Determine settings path */
+    snprintf(g_settings_path, sizeof(g_settings_path),
+             "/mnt/SDCARD/.userdata/shared/ledsettings_brick.txt");
+
+    /* Truncate log */
+    const char *log_dir = getenv("LEDOH_LOG_DIR");
+    char log_path[MAX_PATH_LEN] = {0};
+    if (log_dir) {
+        snprintf(log_path, sizeof(log_path), "%s/ledoh.txt", log_dir);
+        mkdir(log_dir, 0755);
+        FILE *lf = fopen(log_path, "w");
+        if (lf) fclose(lf);
+    }
+
+    ap_config cfg = {
+        .window_title       = "LED'oh!",
+        .log_path           = log_path[0] ? log_path : NULL,
+        .is_nextui          = AP_PLATFORM_IS_DEVICE,
+        .disable_background = true,
+    };
+    if (ap_init(&cfg) != AP_OK) {
+        fprintf(stderr, "Failed to initialise Apostrophe\n");
+        return 1;
+    }
+
+    ap_set_power_handler(false);
+
+    ap_theme *theme = ap_get_theme();
+    theme->background = (ap_color){ DEFAULT_BG_R, DEFAULT_BG_G, DEFAULT_BG_B, 255 };
+    theme->text       = (ap_color){ DEFAULT_TEXT_R, DEFAULT_TEXT_G, DEFAULT_TEXT_B, 255 };
+    theme->hint       = (ap_color){ DEFAULT_HINT_R, DEFAULT_HINT_G, DEFAULT_HINT_B, 255 };
+
+    ap_log("=== LED'oh! v%s starting ===", LEDOH_VERSION);
+    ap_log("STARTUP: settings path = %s", g_settings_path);
+
+    /* Detect device type */
+    char *device = getenv("DEVICE");
+    ap_log("STARTUP: DEVICE env = %s", device ? device : "(null)");
+    if (device && strcmp(device, "brick") == 0) {
+        g_is_brick = 1;
+    } else {
+        g_is_brick = 1; /* Default to brick for now */
+    }
+    ap_log("STARTUP: is_brick = %d", g_is_brick);
+
+    g_zones = g_brick_zones;
+    g_zone_count = MAX_ZONES;
+
+    /* Load device images */
+    load_device_images();
+
+    /* Load settings */
+    load_settings();
+
+    /* Apply current settings to hardware */
+    ap_log("STARTUP: applying loaded settings to hardware (%d zones)", g_zone_count);
+    for (int i = 0; i < g_zone_count; i++)
+        led_apply_zone(i);
+    ap_log("STARTUP: hardware apply complete");
+
+    /* Main screen */
+    show_device_view();
+
+    /* Restore saved LED state so NextUI picks up consistent state */
+    ap_log("EXIT: restoring saved LED state to hardware");
+    led_restore_saved_state();
+    ap_log("EXIT: LED state restored");
+
+    /* Cleanup */
+    if (g_img_front) SDL_DestroyTexture(g_img_front);
+    if (g_img_back) SDL_DestroyTexture(g_img_back);
+
+    ap_log("=== LED'oh! shutting down ===");
+    ap_quit();
+    return 0;
+}

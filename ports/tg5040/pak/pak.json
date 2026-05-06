@@ -1,0 +1,16 @@
+{
+  "name": "LED'oh!",
+  "version": "v0.1.0",
+  "type": "TOOL",
+  "description": "Graphical LED color controller for NextUI on TrimUI Brick.",
+  "author": "Eric Reinsmidt",
+  "repo_url": "https://github.com/ericreinsmidt/nextui-ledoh",
+  "release_filename": "LED'oh!.tg5040.pak.zip",
+  "platforms": [
+    "tg5040"
+  ],
+  "changelog": {
+    "v0.1.0": "Initial release. Front/back device view with LED zone overlays, 2D HSL color picker with live LED preview, per-zone brightness/effect/speed settings, NextUI-compatible settings file."
+  },
+  "screenshots": []
+}

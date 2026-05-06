@@ -1,0 +1,19 @@
+# Build artifacts
+build/
+*.o
+*.elf
+*.dSYM/
+
+# Pak binary (built, not committed)
+ports/tg5040/pak/bin/ledoh
+
+# Distribution
+dist/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+*.swp
+*.swo
