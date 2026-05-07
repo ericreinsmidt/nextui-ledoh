@@ -8,7 +8,7 @@
 [![Downloads](https://img.shields.io/github/downloads/ericreinsmidt/nextui-ledoh/total?style=for-the-badge&color=ff4444)](https://github.com/ericreinsmidt/nextui-ledoh/releases)
 [![License](https://img.shields.io/github/license/ericreinsmidt/nextui-ledoh?style=for-the-badge&color=ff4444)](LICENSE)
 
-A graphical LED color controller for TrimUI Brick and Brick Hammer running NextUI.
+A graphical LED color controller for TrimUI Brick, Brick Hammer, and Smart Pro running NextUI.
 
 </div>
 
@@ -18,6 +18,9 @@ A graphical LED color controller for TrimUI Brick and Brick Hammer running NextU
 - **2D HSL color picker** — Full-screen color field with crosshair cursor and live hardware preview
 - **Per-zone settings** — Brightness, effect type, and animation speed for each LED zone
 - **Real-time feedback** — Physical LEDs update instantly as you pick colors and adjust settings
+- **LED toggle** — Quickly turn all LEDs off or on with the ∴ button
+- **Multi-device support** — Automatically detects Brick, Brick Hammer, or Smart Pro and adapts the UI
+- **Random front images** — Device view randomly picks from available front image variants on each view flip
 - **NextUI compatible** — Reads and writes the same settings file as the built-in LED control
 - **No network required** — Works completely offline
 
@@ -32,9 +35,26 @@ A graphical LED color controller for TrimUI Brick and Brick Hammer running NextU
 | Top Bar | Back | LED strip along the top edge |
 | L/R Triggers | Back | Left and right trigger LEDs |
 
+> **Note:** FN1 and FN2 share a brightness path — changing one changes the other.
+
+### TrimUI Smart Pro
+
+| Zone | View | Description |
+|------|------|-------------|
+| Joystick L | Front | Left joystick ring LED |
+| Logo | Front | Triangle logo indicator LED |
+| Joystick R | Front | Right joystick ring LED |
+
+> **Note:** All Smart Pro zones share a single brightness path — changing brightness on any zone changes all of them.
+
 ## Screenshots
 
-*Coming soon*
+| | | |
+|:---:|:---:|:---:|
+| ![Brick Front](assets/screenshots/brick_front.png) | ![Brick Back](assets/screenshots/brick_back.png) | ![Smart Pro](assets/screenshots/smartpro.png) |
+| Brick — Front | Brick — Back | Smart Pro |
+| ![Color Picker](assets/screenshots/color_picker.png) | ![Zone Settings](assets/screenshots/zone_settings.png) | ![Menu](assets/screenshots/menu.png) |
+| Color Picker | Zone Settings | Menu |
 
 ## Controls
 
@@ -43,11 +63,12 @@ A graphical LED color controller for TrimUI Brick and Brick Hammer running NextU
 | Button | Action |
 |--------|--------|
 | D-pad L/R | Select zone (front view) |
-| D-pad U/D | Select zone (back view) |
-| L1/R1 | Switch front/back view |
+| D-pad U/D | Select zone (back view, Brick only) |
+| L1/R1 | Switch front/back view (Brick only) |
 | A | Open color picker for selected zone |
 | X | Quick save |
 | Y | Menu (zone settings, reset, about) |
+| ∴ | Toggle all LEDs off/on |
 | B | Quit (prompts to save if unsaved changes) |
 
 ### Color Picker
@@ -84,6 +105,7 @@ LED'oh! is available in the [NextUI Pak Store](https://github.com/NextUI-Paks). 
 
 - TrimUI Brick
 - TrimUI Brick Hammer
+- TrimUI Smart Pro
 
 ## Building
 
@@ -96,10 +118,6 @@ make clean      # Remove build artifacts
 ```
 
 The binary is cross-compiled using the `ghcr.io/loveretro/tg5040-toolchain` Docker image. No local cross-compiler setup required.
-
-## Known Limitations
-
-- **Quick-wake re-suspend (TrimUI Brick)** — If you press the power button to sleep and then press it again within approximately one second to wake, the device may briefly wake and then immediately re-suspend. This is a known TrimUI Brick firmware behavior that affects all apps using custom power handling. Waiting a few seconds before waking avoids the issue.
 
 ## Credits
 

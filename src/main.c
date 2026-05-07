@@ -18,12 +18,14 @@
 #include <unistd.h>
 #include <errno.h>
 #include <math.h>
+#include <stdlib.h>
+#include <time.h>
 
 /* -----------------------------------------------------------------------
  * Constants
  * ----------------------------------------------------------------------- */
 
-#define LEDOH_VERSION    "0.1.0"
+#define LEDOH_VERSION    "0.2.0"
 #define MAX_PATH_LEN     1280
 #define MAX_ZONES        4
 #define MAX_LINE         512
@@ -46,11 +48,15 @@
 #define SLIDER_B         2
 #define SLIDER_COUNT     3
 
-/* Device image dimensions (source asset) */
-#define DEV_IMG_W        349
-#define DEV_IMG_H        532
+/* Brick device image dimensions (source asset) */
+#define BRICK_IMG_W      349
+#define BRICK_IMG_H      532
 
-/* LED overlay positions in source image coordinates */
+/* Smart Pro device image dimensions (source asset) */
+#define SP_IMG_W         500
+#define SP_IMG_H         220
+
+/* LED overlay positions in source image coordinates — Brick */
 /* Front: FN1 */
 #define FN1_X            132
 #define FN1_Y            302
@@ -79,10 +85,37 @@
 #define RTRIG_Y          222
 #define RTRIG_H          18
 
+/* LED overlay positions in source image coordinates — Smart Pro */
+/* Triangle (m / Logo): small upward-pointing triangle near bottom center */
+#define SP_TRI_TIP_X     250
+#define SP_TRI_TIP_Y     202
+#define SP_TRI_BL_X      246
+#define SP_TRI_BL_Y      210
+#define SP_TRI_BR_X      254
+#define SP_TRI_BR_Y      210
+
+/* Left joystick ring (l): annulus */
+#define SP_RING_L_CX     58
+#define SP_RING_L_CY     142
+#define SP_RING_L_IR     19    /* inner radius (x spans 39-77, so (77-39)/2 = 19) */
+#define SP_RING_L_OR     25   /* outer radius (x spans 33-82, so (82-33+1)/2 ≈ 25) */
+
+/* Right joystick ring (r): mirrored from left */
+#define SP_RING_R_CX     (SP_IMG_W - SP_RING_L_CX)  /* 442 */
+#define SP_RING_R_CY     SP_RING_L_CY
+#define SP_RING_R_IR     SP_RING_L_IR
+#define SP_RING_R_OR     SP_RING_L_OR
+
 /* Minimum effect value — effect 0 is "Off" which disables the LED entirely.
  * Users should use brightness=0 to turn off an LED, not effect=0.
  * We clamp to 1 (Linear Rise) as the minimum selectable effect. */
 #define EFFECT_MIN       1
+
+/* Default brightness when toggling on a zone that was at 0 */
+#define TOGGLE_ON_DEFAULT_BRIGHTNESS  50
+
+/* Front image variants */
+#define FRONT_IMG_COUNT  3
 
 /* -----------------------------------------------------------------------
  * Data structures
@@ -97,6 +130,7 @@ typedef struct {
 
 typedef struct {
     uint8_t r, g, b;
+    uint8_t r2, g2, b2;    /* color2 — preserved from settings file for NextUI */
     int     effect;
     int     speed;
     int     brightness;
@@ -104,7 +138,7 @@ typedef struct {
     int     inbrightness;
 } zone_state_t;
 
-/* LED overlay rectangle in source image coordinates */
+/* LED overlay rectangle in source image coordinates (Brick) */
 typedef struct {
     int x, y, w, h;
     int rounded;  /* 1 = draw with rounded corners */
@@ -121,12 +155,24 @@ static const zone_def_t g_brick_zones[MAX_ZONES] = {
     { "L/R Triggers", "lr", VIEW_BACK,  1 },
 };
 
-/* Overlay positions per zone (source image coords) */
+/* Overlay positions per zone (source image coords) — Brick */
 static const led_overlay_t g_brick_overlays[MAX_ZONES] = {
     { FN1_X, FN1_Y, FN1_W, FN1_H, 1 },       /* f1 */
     { FN2_X, FN2_Y, FN2_W, FN2_H, 1 },       /* f2 */
     { TOPBAR_X, TOPBAR_Y, TOPBAR_W, TOPBAR_H, 0 },  /* m */
     { 0, 0, 0, 0, 0 },                         /* lr — special: two rects */
+};
+
+/* -----------------------------------------------------------------------
+ * Zone definitions — Smart Pro
+ * ----------------------------------------------------------------------- */
+
+#define SP_ZONE_COUNT    3
+
+static const zone_def_t g_smartpro_zones[SP_ZONE_COUNT] = {
+    { "Joystick L", "l", VIEW_FRONT, 0 },
+    { "Logo",       "m", VIEW_FRONT, 1 },
+    { "Joystick R", "r", VIEW_FRONT, 2 },
 };
 
 /* -----------------------------------------------------------------------
@@ -137,6 +183,10 @@ static int           g_is_brick     = 1;
 static int           g_zone_count   = MAX_ZONES;
 static const zone_def_t *g_zones    = g_brick_zones;
 
+/* Device image dimensions (set at runtime based on device) */
+static int           g_dev_img_w    = BRICK_IMG_W;
+static int           g_dev_img_h    = BRICK_IMG_H;
+
 static zone_state_t  g_zone_state[MAX_ZONES];
 static zone_state_t  g_zone_saved[MAX_ZONES];   /* last-saved state for dirty check */
 static int           g_current_view = VIEW_FRONT;
@@ -145,11 +195,17 @@ static int           g_selected_zone = 0;        /* index into g_zones[] */
 static char          g_settings_path[MAX_PATH_LEN] = {0};
 
 /* Device images */
-static SDL_Texture  *g_img_front = NULL;
+static SDL_Texture  *g_img_front_variants[FRONT_IMG_COUNT] = {NULL};
+static int           g_img_front_valid_count = 0;  /* how many loaded successfully */
+static int           g_img_front_valid[FRONT_IMG_COUNT] = {0}; /* which indices loaded */
+static SDL_Texture  *g_img_front_active = NULL;    /* currently displayed front image */
 static SDL_Texture  *g_img_back  = NULL;
 
 /* Pulse animation */
 static Uint32        g_pulse_start = 0;
+
+/* LED toggle — saved brightness for restore on toggle-on */
+static int           g_toggle_saved_brightness[MAX_ZONES] = {0};
 
 /* -----------------------------------------------------------------------
  * String helpers
@@ -195,8 +251,12 @@ static void led_write_color(const char *filename, uint8_t r, uint8_t g, uint8_t 
     char path[256];
     snprintf(path, sizeof(path), "/sys/class/led_anim/effect_rgb_hex_%s", filename);
     char hex[16];
-    snprintf(hex, sizeof(hex), "%02X%02X%02X", r, g, b);
-    ap_log("LED COLOR [%s]: #%s", filename, hex);
+    /* Smart Pro 'm' zone LED expects GRB byte order */
+    if (!g_is_brick && strcmp(filename, "m") == 0)
+        snprintf(hex, sizeof(hex), "%02X%02X%02X", g, r, b);
+    else
+        snprintf(hex, sizeof(hex), "%02X%02X%02X", r, g, b);
+    ap_log("LED COLOR [%s]: #%s (raw:%02X%02X%02X)", filename, hex, r, g, b);
     sysfs_write(path, hex);
 }
 
@@ -285,6 +345,63 @@ static void led_restore_saved_state(void) {
     ap_log("LED RESTORE: done");
 }
 
+/* Toggle all LEDs off — saves brightness, sets to 0 */
+static void led_toggle_off(void) {
+    ap_log("LED TOGGLE OFF: saving brightness and setting all to 0");
+    for (int i = 0; i < g_zone_count; i++) {
+        g_toggle_saved_brightness[i] = g_zone_state[i].brightness;
+        g_zone_state[i].brightness = 0;
+        led_write_brightness(g_zones[i].filename, 0);
+    }
+    /* Sync shared brightness on Brick (f1/f2) */
+    if (g_is_brick) {
+        g_zone_state[0].brightness = 0;
+        g_zone_state[1].brightness = 0;
+    }
+}
+
+/* Toggle all LEDs on — restores saved brightness (default 50 if was 0) */
+static void led_toggle_on(void) {
+    ap_log("LED TOGGLE ON: restoring brightness");
+    for (int i = 0; i < g_zone_count; i++) {
+        int restored = g_toggle_saved_brightness[i];
+        if (restored <= 0) restored = TOGGLE_ON_DEFAULT_BRIGHTNESS;
+        g_zone_state[i].brightness = restored;
+        led_write_brightness(g_zones[i].filename, restored);
+    }
+    /* Sync shared brightness on Brick (f1/f2) */
+    if (g_is_brick) {
+        int fn_brightness = g_zone_state[0].brightness;
+        g_zone_state[1].brightness = fn_brightness;
+    }
+}
+
+/* Check if all LEDs are currently off (brightness 0) */
+static int all_leds_off(void) {
+    for (int i = 0; i < g_zone_count; i++) {
+        if (g_zone_state[i].brightness > 0) return 0;
+    }
+    return 1;
+}
+
+/* Sync brightness after a single zone change (handles shared hardware paths) */
+static void sync_brightness_after_change(int zone_idx) {
+    if (g_is_brick) {
+        const char *fn = g_zones[zone_idx].filename;
+        int val = g_zone_state[zone_idx].brightness;
+        if (strcmp(fn, "f1") == 0)
+            g_zone_state[1].brightness = val;
+        else if (strcmp(fn, "f2") == 0)
+            g_zone_state[0].brightness = val;
+    } else {
+        /* Smart Pro: all zones share max_scale */
+        int val = g_zone_state[zone_idx].brightness;
+        for (int i = 0; i < g_zone_count; i++) {
+            g_zone_state[i].brightness = val;
+        }
+    }
+}
+
 /* -----------------------------------------------------------------------
  * Settings file: load / save (NextUI-compatible INI format)
  * ----------------------------------------------------------------------- */
@@ -294,6 +411,7 @@ static void set_defaults(void) {
     for (int i = 0; i < g_zone_count; i++) {
         g_zone_state[i] = (zone_state_t){
             .r = 255, .g = 255, .b = 255,
+            .r2 = 255, .g2 = 255, .b2 = 255,
             .effect = 4,
             .speed = 1000,
             .brightness = 100,
@@ -364,6 +482,8 @@ static void load_settings(void) {
 
         if (strcmp(key, "color1") == 0) {
             parse_color(val, &zs->r, &zs->g, &zs->b);
+        } else if (strcmp(key, "color2") == 0) {
+            parse_color(val, &zs->r2, &zs->g2, &zs->b2);
         } else if (strcmp(key, "effect") == 0) {
             zs->effect = atoi(val);
             /* Clamp effect: 0 means "Off" which disables the LED.
@@ -390,8 +510,9 @@ static void load_settings(void) {
     /* Log loaded state */
     for (int i = 0; i < g_zone_count; i++) {
         zone_state_t *zs = &g_zone_state[i];
-        ap_log("SETTINGS LOADED [%d/%s]: r=%d g=%d b=%d effect=%d brightness=%d speed=%d trigger=%d inbrightness=%d",
+        ap_log("SETTINGS LOADED [%d/%s]: r=%d g=%d b=%d r2=%d g2=%d b2=%d effect=%d brightness=%d speed=%d trigger=%d inbrightness=%d",
                i, g_zones[i].filename, zs->r, zs->g, zs->b,
+               zs->r2, zs->g2, zs->b2,
                zs->effect, zs->brightness, zs->speed, zs->trigger, zs->inbrightness);
     }
 
@@ -399,6 +520,11 @@ static void load_settings(void) {
 
     /* Copy to saved state for dirty tracking */
     memcpy(g_zone_saved, g_zone_state, sizeof(g_zone_saved));
+
+    /* Initialize toggle saved brightness from loaded values */
+    for (int i = 0; i < g_zone_count; i++) {
+        g_toggle_saved_brightness[i] = g_zone_state[i].brightness;
+    }
 }
 
 static void save_settings(void) {
@@ -422,15 +548,19 @@ static void save_settings(void) {
     for (int i = 0; i < g_zone_count; i++) {
         const zone_def_t *zd = &g_zones[i];
         zone_state_t *zs = &g_zone_state[i];
-        uint32_t color = ((uint32_t)zs->r << 16) | ((uint32_t)zs->g << 8) | zs->b;
+        uint32_t color1 = ((uint32_t)zs->r << 16) | ((uint32_t)zs->g << 8) | zs->b;
+        /* color2 is preserved from the settings file — not overwritten with color1 */
+        uint32_t color2 = ((uint32_t)zs->r2 << 16) | ((uint32_t)zs->g2 << 8) | zs->b2;
 
-        ap_log("SETTINGS SAVED [%d/%s]: r=%d g=%d b=%d effect=%d brightness=%d speed=%d",
-               i, zd->filename, zs->r, zs->g, zs->b, zs->effect, zs->brightness, zs->speed);
+        ap_log("SETTINGS SAVED [%d/%s]: r=%d g=%d b=%d r2=%d g2=%d b2=%d effect=%d brightness=%d speed=%d",
+               i, zd->filename, zs->r, zs->g, zs->b,
+               zs->r2, zs->g2, zs->b2,
+               zs->effect, zs->brightness, zs->speed);
 
         fprintf(f, "[%s]\n", zd->filename);
         fprintf(f, "effect=%d\n", zs->effect);
-        fprintf(f, "color1=0x%06X\n", color);
-        fprintf(f, "color2=0x%06X\n", color);
+        fprintf(f, "color1=0x%06X\n", color1);
+        fprintf(f, "color2=0x%06X\n", color2);
         fprintf(f, "speed=%d\n", zs->speed);
         fprintf(f, "brightness=%d\n", zs->brightness);
         fprintf(f, "trigger=%d\n", zs->trigger);
@@ -452,31 +582,78 @@ static int is_dirty(void) {
  * Device image loading
  * ----------------------------------------------------------------------- */
 
+/* Pick a random front image from loaded variants */
+static void pick_random_front(void) {
+    if (g_img_front_valid_count <= 0) {
+        g_img_front_active = NULL;
+        return;
+    }
+    if (g_img_front_valid_count == 1) {
+        /* Only one loaded — always use it */
+        for (int i = 0; i < FRONT_IMG_COUNT; i++) {
+            if (g_img_front_valid[i]) {
+                g_img_front_active = g_img_front_variants[i];
+                return;
+            }
+        }
+    }
+    /* Pick randomly from valid variants */
+    int pick = rand() % g_img_front_valid_count;
+    int count = 0;
+    for (int i = 0; i < FRONT_IMG_COUNT; i++) {
+        if (g_img_front_valid[i]) {
+            if (count == pick) {
+                g_img_front_active = g_img_front_variants[i];
+                ap_log("FRONT IMAGE: picked variant %d", i + 1);
+                return;
+            }
+            count++;
+        }
+    }
+}
+
 static void load_device_images(void) {
     const char *pak_dir = getenv("LEDOH_PAK_DIR");
     char path[MAX_PATH_LEN];
 
-    if (pak_dir) {
-        snprintf(path, sizeof(path), "%s/res/front.png", pak_dir);
-    } else {
-        snprintf(path, sizeof(path), "res/front.png");
-    }
-    g_img_front = ap_load_image(path);
-    if (g_img_front)
-        ap_log("loaded front image: %s", path);
-    else
-        ap_log("WARNING: could not load front image: %s", path);
+    /* Determine filename prefix based on device */
+    const char *front_prefix = g_is_brick ? "front" : "smart";
 
-    if (pak_dir) {
-        snprintf(path, sizeof(path), "%s/res/back.png", pak_dir);
-    } else {
-        snprintf(path, sizeof(path), "res/back.png");
+    /* Load front image variants (front1.png/smart1.png, front2.png/smart2.png, front3.png/smart3.png) */
+    g_img_front_valid_count = 0;
+    for (int i = 0; i < FRONT_IMG_COUNT; i++) {
+        g_img_front_valid[i] = 0;
+        if (pak_dir)
+            snprintf(path, sizeof(path), "%s/res/%s%d.png", pak_dir, front_prefix, i + 1);
+        else
+            snprintf(path, sizeof(path), "res/%s%d.png", front_prefix, i + 1);
+
+        g_img_front_variants[i] = ap_load_image(path);
+        if (g_img_front_variants[i]) {
+            g_img_front_valid[i] = 1;
+            g_img_front_valid_count++;
+            ap_log("loaded front variant %d: %s", i + 1, path);
+        } else {
+            ap_log("front variant %d not found: %s (skipping)", i + 1, path);
+        }
     }
-    g_img_back = ap_load_image(path);
-    if (g_img_back)
-        ap_log("loaded back image: %s", path);
-    else
-        ap_log("WARNING: could not load back image: %s", path);
+
+    /* Pick initial random front image */
+    pick_random_front();
+
+    /* Load back image (Brick only) */
+    if (g_is_brick) {
+        if (pak_dir)
+            snprintf(path, sizeof(path), "%s/res/back.png", pak_dir);
+        else
+            snprintf(path, sizeof(path), "res/back.png");
+
+        g_img_back = ap_load_image(path);
+        if (g_img_back)
+            ap_log("loaded back image: %s", path);
+        else
+            ap_log("WARNING: could not load back image: %s", path);
+    }
 }
 
 /* -----------------------------------------------------------------------
@@ -494,13 +671,13 @@ static void calc_device_rect(int content_y, int content_h,
     int max_w = sw - pad * 8;
     int max_h = content_h - pad * 4;
 
-    float scale_w = (float)max_w / (float)DEV_IMG_W;
-    float scale_h = (float)max_h / (float)DEV_IMG_H;
+    float scale_w = (float)max_w / (float)g_dev_img_w;
+    float scale_h = (float)max_h / (float)g_dev_img_h;
     float scale = (scale_w < scale_h) ? scale_w : scale_h;
     if (scale > 2.0f) scale = 2.0f;  /* cap scaling */
 
-    int draw_w = (int)(DEV_IMG_W * scale);
-    int draw_h = (int)(DEV_IMG_H * scale);
+    int draw_w = (int)(g_dev_img_w * scale);
+    int draw_h = (int)(g_dev_img_h * scale);
     int draw_x = (sw - draw_w) / 2;
     int draw_y = content_y + (content_h - draw_h) / 2;
 
@@ -551,9 +728,116 @@ static void draw_selection_border(int x, int y, int w, int h,
                     255, 255, 255, alpha);
 }
 
-/* Draw LED overlay for a zone at scaled position on the device image */
-static void draw_led_overlay(int zone_idx, int img_x, int img_y, float scale,
-                              int is_selected) {
+/* Draw a filled triangle with alpha (scanline fill) */
+static void draw_filled_triangle(int x0, int y0, int x1, int y1, int x2, int y2,
+                                  uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    SDL_SetRenderDrawBlendMode(ap__g.renderer, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(ap__g.renderer, r, g, b, a);
+
+    /* Sort vertices by y coordinate */
+    int vx[3] = {x0, x1, x2};
+    int vy[3] = {y0, y1, y2};
+    for (int i = 0; i < 2; i++) {
+        for (int j = i + 1; j < 3; j++) {
+            if (vy[j] < vy[i]) {
+                int tmp;
+                tmp = vx[i]; vx[i] = vx[j]; vx[j] = tmp;
+                tmp = vy[i]; vy[i] = vy[j]; vy[j] = tmp;
+            }
+        }
+    }
+
+    /* Scanline fill */
+    for (int y = vy[0]; y <= vy[2]; y++) {
+        int xa, xb;
+        if (y < vy[1]) {
+            if (vy[1] == vy[0]) continue;
+            xa = vx[0] + (vx[1] - vx[0]) * (y - vy[0]) / (vy[1] - vy[0]);
+            xb = vx[0] + (vx[2] - vx[0]) * (y - vy[0]) / (vy[2] - vy[0]);
+        } else {
+            if (vy[2] == vy[1]) {
+                xa = vx[1];
+                xb = vx[2];
+            } else {
+                xa = vx[1] + (vx[2] - vx[1]) * (y - vy[1]) / (vy[2] - vy[1]);
+                xb = vx[0] + (vx[2] - vx[0]) * (y - vy[0]) / (vy[2] - vy[0]);
+            }
+        }
+        if (xa > xb) { int tmp = xa; xa = xb; xb = tmp; }
+        SDL_RenderDrawLine(ap__g.renderer, xa, y, xb, y);
+    }
+}
+
+/* Draw a triangle outline (scaled from centroid) */
+static void draw_triangle_outline(int x0, int y0, int x1, int y1, int x2, int y2,
+                                    int thickness,
+                                    uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    SDL_SetRenderDrawBlendMode(ap__g.renderer, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(ap__g.renderer, r, g, b, a);
+
+    /* Scale triangle outward from centroid */
+    float cx = (x0 + x1 + x2) / 3.0f;
+    float cy = (y0 + y1 + y2) / 3.0f;
+    float expand = 1.0f + (float)thickness * 0.3f;
+
+    int ox0 = (int)(cx + (x0 - cx) * expand);
+    int oy0 = (int)(cy + (y0 - cy) * expand);
+    int ox1 = (int)(cx + (x1 - cx) * expand);
+    int oy1 = (int)(cy + (y1 - cy) * expand);
+    int ox2 = (int)(cx + (x2 - cx) * expand);
+    int oy2 = (int)(cy + (y2 - cy) * expand);
+
+    for (int t = 0; t < thickness; t++) {
+        float s = 1.0f - (float)t / (float)(thickness > 1 ? thickness : 1) * 0.15f;
+        int tx0 = (int)(cx + (ox0 - cx) * s);
+        int ty0 = (int)(cy + (oy0 - cy) * s);
+        int tx1 = (int)(cx + (ox1 - cx) * s);
+        int ty1 = (int)(cy + (oy1 - cy) * s);
+        int tx2 = (int)(cx + (ox2 - cx) * s);
+        int ty2 = (int)(cy + (oy2 - cy) * s);
+        SDL_RenderDrawLine(ap__g.renderer, tx0, ty0, tx1, ty1);
+        SDL_RenderDrawLine(ap__g.renderer, tx1, ty1, tx2, ty2);
+        SDL_RenderDrawLine(ap__g.renderer, tx2, ty2, tx0, ty0);
+    }
+}
+
+/* Draw a filled ring/annulus with alpha (scanline fill) */
+static void draw_filled_ring(int cx, int cy, int inner_r, int outer_r,
+                              uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    SDL_SetRenderDrawBlendMode(ap__g.renderer, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(ap__g.renderer, r, g, b, a);
+
+    for (int dy = -outer_r; dy <= outer_r; dy++) {
+        /* Calculate x span for outer circle at this y */
+        float ox = sqrtf((float)(outer_r * outer_r - dy * dy));
+        int outer_x1 = (int)(cx - ox);
+        int outer_x2 = (int)(cx + ox);
+
+        if (abs(dy) < inner_r) {
+            /* Inside inner circle — draw two segments (left and right arcs) */
+            float ix = sqrtf((float)(inner_r * inner_r - dy * dy));
+            int inner_x1 = (int)(cx - ix);
+            int inner_x2 = (int)(cx + ix);
+            /* Left arc */
+            SDL_RenderDrawLine(ap__g.renderer, outer_x1, cy + dy, inner_x1, cy + dy);
+            /* Right arc */
+            SDL_RenderDrawLine(ap__g.renderer, inner_x2, cy + dy, outer_x2, cy + dy);
+        } else {
+            /* Outside inner circle — draw full horizontal span */
+            SDL_RenderDrawLine(ap__g.renderer, outer_x1, cy + dy, outer_x2, cy + dy);
+        }
+    }
+}
+
+/* Draw a ring outline (thin circle at given radius) */
+static void draw_ring_outline(int cx, int cy, int radius, int thickness,
+                               uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    draw_filled_ring(cx, cy, radius, radius + thickness, r, g, b, a);
+}
+
+/* Draw LED overlay for Brick zones */
+static void draw_led_overlay_brick(int zone_idx, int img_x, int img_y, float scale,
+                                    int is_selected) {
     zone_state_t *zs = &g_zone_state[zone_idx];
     uint8_t led_alpha = 180;
     int border_thick = (int)(2.0f * scale);
@@ -569,7 +853,7 @@ static void draw_led_overlay(int zone_idx, int img_x, int img_y, float scale,
         draw_rect_alpha(lx, ly, lw, lh, zs->r, zs->g, zs->b, led_alpha);
 
         /* Right trigger (mirrored) */
-        int rx = img_x + (int)((DEV_IMG_W - LTRIG_W - 8) * scale);
+        int rx = img_x + (int)((BRICK_IMG_W - LTRIG_W - 8) * scale);
         int ry = ly;
         int rw = lw;
         int rh = lh;
@@ -595,11 +879,87 @@ static void draw_led_overlay(int zone_idx, int img_x, int img_y, float scale,
             draw_rect_alpha(ox, oy, ow, oh, zs->r, zs->g, zs->b, led_alpha);
         }
 
-        if (is_selected) {
+        /* Draw pill border BEHIND the fill */
+        if (is_selected && ov->rounded) {
+            uint8_t pulse_a = get_pulse_alpha();
+            int t = border_thick;
+            ap_color border_c = { 255, 255, 255, pulse_a };
+            ap_draw_pill(ox - t, oy - t, ow + t * 2, oh + t * 2, border_c);
+        }
+
+        /* Draw the fill */
+        if (ov->rounded) {
+            ap_color c = { zs->r, zs->g, zs->b, led_alpha };
+            ap_draw_pill(ox, oy, ow, oh, c);
+        } else {
+            draw_rect_alpha(ox, oy, ow, oh, zs->r, zs->g, zs->b, led_alpha);
+        }
+
+        /* Rectangular border drawn AFTER fill (it's outside) */
+        if (is_selected && !ov->rounded) {
             uint8_t pulse_a = get_pulse_alpha();
             draw_selection_border(ox, oy, ow, oh, pulse_a, border_thick);
         }
     }
+}
+
+/* Draw LED overlay for Smart Pro zones */
+static void draw_led_overlay_smartpro(int zone_idx, int img_x, int img_y, float scale,
+                                       int is_selected) {
+    zone_state_t *zs = &g_zone_state[zone_idx];
+    uint8_t led_alpha = 180;
+    int border_thick = (int)(2.0f * scale);
+    if (border_thick < 2) border_thick = 2;
+
+    const char *fn = g_zones[zone_idx].filename;
+
+    if (strcmp(fn, "l") == 0) {
+        /* Left joystick ring */
+        int cx = img_x + (int)(SP_RING_L_CX * scale);
+        int cy = img_y + (int)(SP_RING_L_CY * scale);
+        int ir = (int)(SP_RING_L_IR * scale);
+        int or_ = (int)(SP_RING_L_OR * scale);
+        draw_filled_ring(cx, cy, ir, or_, zs->r, zs->g, zs->b, led_alpha);
+        if (is_selected) {
+            uint8_t pulse_a = get_pulse_alpha();
+            draw_ring_outline(cx, cy, or_, border_thick, 0, 0, 0, pulse_a);
+        }
+    } else if (strcmp(fn, "r") == 0) {
+        /* Right joystick ring (mirrored) */
+        int cx = img_x + (int)(SP_RING_R_CX * scale);
+        int cy = img_y + (int)(SP_RING_R_CY * scale);
+        int ir = (int)(SP_RING_R_IR * scale);
+        int or_ = (int)(SP_RING_R_OR * scale);
+        draw_filled_ring(cx, cy, ir, or_, zs->r, zs->g, zs->b, led_alpha);
+        if (is_selected) {
+            uint8_t pulse_a = get_pulse_alpha();
+            draw_ring_outline(cx, cy, or_, border_thick, 0, 0, 0, pulse_a);
+        }
+    } else if (strcmp(fn, "m") == 0) {
+        /* Logo triangle */
+        int tx0 = img_x + (int)(SP_TRI_TIP_X * scale);
+        int ty0 = img_y + (int)(SP_TRI_TIP_Y * scale);
+        int tx1 = img_x + (int)(SP_TRI_BL_X * scale);
+        int ty1 = img_y + (int)(SP_TRI_BL_Y * scale);
+        int tx2 = img_x + (int)(SP_TRI_BR_X * scale);
+        int ty2 = img_y + (int)(SP_TRI_BR_Y * scale);
+        draw_filled_triangle(tx0, ty0, tx1, ty1, tx2, ty2,
+                             zs->r, zs->g, zs->b, led_alpha);
+        if (is_selected) {
+            uint8_t pulse_a = get_pulse_alpha();
+            draw_triangle_outline(tx0, ty0, tx1, ty1, tx2, ty2,
+                                  border_thick, 0, 0, 0, pulse_a);
+        }
+    }
+}
+
+/* Draw LED overlay — dispatches to device-specific function */
+static void draw_led_overlay(int zone_idx, int img_x, int img_y, float scale,
+                              int is_selected) {
+    if (g_is_brick)
+        draw_led_overlay_brick(zone_idx, img_x, img_y, scale, is_selected);
+    else
+        draw_led_overlay_smartpro(zone_idx, img_x, img_y, scale, is_selected);
 }
 
 /* -----------------------------------------------------------------------
@@ -614,6 +974,13 @@ static int first_zone_in_view(int view) {
     return 0;
 }
 
+/* Check if any zones exist in the given view */
+static int has_zones_in_view(int view) {
+    for (int i = 0; i < g_zone_count; i++) {
+        if (g_zones[i].view == view) return 1;
+    }
+    return 0;
+}
 
 /* -----------------------------------------------------------------------
  * Effect names
@@ -657,6 +1024,18 @@ static void show_zone_settings(int zone_idx) {
     int running = 1;
     int l1_held = 0, r1_held = 0;
 
+    /* Determine brightness sharing note */
+    const char *brightness_note = NULL;
+    if (g_is_brick) {
+        if (strcmp(zd->filename, "f1") == 0)
+            brightness_note = "Shared with FN2";
+        else if (strcmp(zd->filename, "f2") == 0)
+            brightness_note = "Shared with FN1";
+    } else {
+        /* Smart Pro: all zones share max_scale */
+        brightness_note = "Shared across all zones";
+    }
+
     while (running) {
         ap_input_event ev;
         while (ap_poll_input(&ev)) {
@@ -672,6 +1051,7 @@ static void show_zone_settings(int zone_idx) {
                             zs->brightness = orig_brightness;
                             zs->effect = orig_effect;
                             zs->speed = orig_speed;
+                            sync_brightness_after_change(zone_idx);
                             led_apply_zone(zone_idx);
                             running = 0;
                         }
@@ -706,12 +1086,8 @@ static void show_zone_settings(int zone_idx) {
                                 if (v < 0) v = 0;
                                 if (v > 100) v = 100;
                                 zs->brightness = v;
+                                sync_brightness_after_change(zone_idx);
                                 led_write_brightness(zd->filename, zs->brightness);
-                                /* f1 and f2 share brightness — sync them */
-                                if (strcmp(zd->filename, "f1") == 0)
-                                    g_zone_state[1].brightness = v;
-                                else if (strcmp(zd->filename, "f2") == 0)
-                                    g_zone_state[0].brightness = v;
                                 break;
                             }
                             case ZS_ROW_EFFECT: {
@@ -758,6 +1134,7 @@ static void show_zone_settings(int zone_idx) {
 
         TTF_Font *font_med   = ap_get_font(AP_FONT_MEDIUM);
         TTF_Font *font_small = ap_get_font(AP_FONT_SMALL);
+        TTF_Font *font_tiny  = ap_get_font(AP_FONT_TINY);
 
         ap_theme *theme = ap_get_theme();
         ap_color text_color = theme->text;
@@ -793,7 +1170,11 @@ static void show_zone_settings(int zone_idx) {
         int value_x = sw / 2;
 
         for (int r = 0; r < ZS_ROW_COUNT; r++) {
-            int ry = y + r * row_h;
+            int ry = y + r * (row_h + (r == 0 && brightness_note ? TTF_FontHeight(font_tiny) + pad : 0));
+            /* Adjust y offset for rows after brightness if note is present */
+            if (r > 0 && brightness_note)
+                ry = y + r * row_h + TTF_FontHeight(font_tiny) + pad;
+
             int is_active = (r == active_row);
             const char *label = "";
             char value_str[64] = {0};
@@ -806,9 +1187,9 @@ static void show_zone_settings(int zone_idx) {
                 case ZS_ROW_EFFECT:
                     label = "Effect";
                     if (zs->effect >= 0 && zs->effect < EFFECT_COUNT)
-                        snprintf(value_str, sizeof(value_str), "< %s >", g_effect_names[zs->effect]);
+                        snprintf(value_str, sizeof(value_str), "%s", g_effect_names[zs->effect]);
                     else
-                        snprintf(value_str, sizeof(value_str), "< %d >", zs->effect);
+                        snprintf(value_str, sizeof(value_str), "%d", zs->effect);
                     break;
                 case ZS_ROW_SPEED:
                     label = "Speed";
@@ -839,6 +1220,12 @@ static void show_zone_settings(int zone_idx) {
                 int fill_w = (zs->brightness * bar_w) / 100;
                 ap_color bar_fill = is_active ? hl_text : text_color;
                 ap_draw_rect(bar_x, bar_y_pos, fill_w, bar_h, bar_fill);
+
+                /* Brightness sharing note */
+                if (brightness_note) {
+                    int note_y = ry + row_h + pad;
+                    ap_draw_text(font_tiny, brightness_note, label_x + pad, note_y, hint_color);
+                }
             }
         }
 
@@ -969,6 +1356,9 @@ static void show_color_picker(int zone_idx) {
     SDL_Texture *field_tex = SDL_CreateTexture(ap__g.renderer,
         SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING, field_w, field_h);
 
+    /* Open joystick once for the duration of the color picker */
+    SDL_Joystick *joy = (SDL_NumJoysticks() > 0) ? SDL_JoystickOpen(0) : NULL;
+
     int running = 1;
     int field_dirty = 1;  /* rebuild texture on first frame */
     int cursor_speed = 2;
@@ -1010,34 +1400,30 @@ static void show_color_picker(int zone_idx) {
             }
         }
 
-        /* Check d-pad held state via SDL for smooth diagonal movement */
-        const Uint8 *keys = SDL_GetKeyboardState(NULL);
+        /* Check d-pad held state via SDL joystick for smooth diagonal movement */
         int dx = 0, dy = 0;
 
-        /* Use SDL joystick hat or gamecontroller for d-pad on device */
-        {
-            int num_joy = SDL_NumJoysticks();
-            if (num_joy > 0) {
-                SDL_Joystick *joy = SDL_JoystickOpen(0);
-                if (joy) {
-                    Sint16 ax = SDL_JoystickGetAxis(joy, 0);  /* left stick X */
-                    Sint16 ay = SDL_JoystickGetAxis(joy, 1);  /* left stick Y */
-                    /* D-pad via hat */
-                    if (SDL_JoystickNumHats(joy) > 0) {
-                        Uint8 hat = SDL_JoystickGetHat(joy, 0);
-                        if (hat & SDL_HAT_LEFT)  dx -= cursor_speed;
-                        if (hat & SDL_HAT_RIGHT) dx += cursor_speed;
-                        if (hat & SDL_HAT_UP)    dy -= cursor_speed;
-                        if (hat & SDL_HAT_DOWN)  dy += cursor_speed;
-                    }
-                    /* Also check analog stick with deadzone */
-                    if (ax < -8000) dx -= cursor_speed;
-                    if (ax >  8000) dx += cursor_speed;
-                    if (ay < -8000) dy -= cursor_speed;
-                    if (ay >  8000) dy += cursor_speed;
-                }
+        if (joy) {
+            /* D-pad via hat */
+            if (SDL_JoystickNumHats(joy) > 0) {
+                Uint8 hat = SDL_JoystickGetHat(joy, 0);
+                if (hat & SDL_HAT_LEFT)  dx -= cursor_speed;
+                if (hat & SDL_HAT_RIGHT) dx += cursor_speed;
+                if (hat & SDL_HAT_UP)    dy -= cursor_speed;
+                if (hat & SDL_HAT_DOWN)  dy += cursor_speed;
             }
-            /* Keyboard fallback for dev mode */
+            /* Also check analog stick with deadzone */
+            Sint16 ax = SDL_JoystickGetAxis(joy, 0);
+            Sint16 ay = SDL_JoystickGetAxis(joy, 1);
+            if (ax < -8000) dx -= cursor_speed;
+            if (ax >  8000) dx += cursor_speed;
+            if (ay < -8000) dy -= cursor_speed;
+            if (ay >  8000) dy += cursor_speed;
+        }
+
+        /* Keyboard fallback for dev mode */
+        {
+            const Uint8 *keys = SDL_GetKeyboardState(NULL);
             if (keys[SDL_SCANCODE_LEFT])  dx -= cursor_speed;
             if (keys[SDL_SCANCODE_RIGHT]) dx += cursor_speed;
             if (keys[SDL_SCANCODE_UP])    dy -= cursor_speed;
@@ -1134,7 +1520,7 @@ static void show_color_picker(int zone_idx) {
         int cross_size = AP_DS(8);
         int cross_thick = 2;
 
-        /* White outline for visibility on any background */
+        /* Black outline for visibility on any background */
         draw_rect_alpha(cx - cross_size - 1, cy - 1, cross_size * 2 + 3, cross_thick + 2,
                         0, 0, 0, 180);
         draw_rect_alpha(cx - 1, cy - cross_size - 1, cross_thick + 2, cross_size * 2 + 3,
@@ -1170,6 +1556,9 @@ static void show_color_picker(int zone_idx) {
         ap_present();
     }
 
+    /* Close joystick */
+    if (joy) SDL_JoystickClose(joy);
+
     if (field_tex) SDL_DestroyTexture(field_tex);
 
     /* Re-apply full zone state (restores effect, speed, etc.) */
@@ -1202,25 +1591,45 @@ static void show_menu(void) {
             break;
         }
         case 1: {
-            /* Reset selected zone */
+            /* Reset selected zone — preserve color2, trigger, inbrightness */
             char msg[128];
             snprintf(msg, sizeof(msg), "Reset %s to white?", g_zones[g_selected_zone].name);
             if (pakkit_confirm(msg, "Reset", "Cancel")) {
-                ap_log("MENU: resetting zone %d/%s to defaults",
+                ap_log("MENU: resetting zone %d/%s to defaults (preserving color2/trigger/inbrightness)",
                        g_selected_zone, g_zones[g_selected_zone].filename);
-                g_zone_state[g_selected_zone] = (zone_state_t){
+                zone_state_t *zs = &g_zone_state[g_selected_zone];
+                /* Preserve NextUI fields */
+                uint8_t saved_r2 = zs->r2, saved_g2 = zs->g2, saved_b2 = zs->b2;
+                int saved_trigger = zs->trigger;
+                int saved_inbrightness = zs->inbrightness;
+                /* Reset to defaults */
+                *zs = (zone_state_t){
                     .r = 255, .g = 255, .b = 255,
+                    .r2 = saved_r2, .g2 = saved_g2, .b2 = saved_b2,
                     .effect = 4, .speed = 1000, .brightness = 100,
-                    .trigger = 1, .inbrightness = 100,
+                    .trigger = saved_trigger, .inbrightness = saved_inbrightness,
                 };
+                sync_brightness_after_change(g_selected_zone);
                 led_apply_zone(g_selected_zone);
             }
             break;
         }
         case 2: {
             if (pakkit_confirm("Reset all zones to white?", "Reset All", "Cancel")) {
-                ap_log("MENU: resetting all zones to defaults");
-                set_defaults();
+                ap_log("MENU: resetting all zones to defaults (preserving color2/trigger/inbrightness)");
+                for (int i = 0; i < g_zone_count; i++) {
+                    zone_state_t *zs = &g_zone_state[i];
+                    /* Preserve NextUI fields */
+                    uint8_t saved_r2 = zs->r2, saved_g2 = zs->g2, saved_b2 = zs->b2;
+                    int saved_trigger = zs->trigger;
+                    int saved_inbrightness = zs->inbrightness;
+                    *zs = (zone_state_t){
+                        .r = 255, .g = 255, .b = 255,
+                        .r2 = saved_r2, .g2 = saved_g2, .b2 = saved_b2,
+                        .effect = 4, .speed = 1000, .brightness = 100,
+                        .trigger = saved_trigger, .inbrightness = saved_inbrightness,
+                    };
+                }
                 for (int i = 0; i < g_zone_count; i++)
                     led_apply_zone(i);
             }
@@ -1230,12 +1639,12 @@ static void show_menu(void) {
             pakkit_info_pair info[] = {
                 { .key = "Version", .value = LEDOH_VERSION },
                 { .key = "Platform", .value = AP_PLATFORM_NAME },
-                { .key = "UI", .value = "PakKit / Apostrophe" },
+                { .key = "UI", .value = "PakKit" },
                 { .key = "License", .value = "MIT" },
             };
             const char *credits[] = {
                 "LED'oh! by Eric Reinsmidt",
-                "Built with PakKit and Apostrophe",
+                "Built with Apostrophe",
                 "For NextUI by LoveRetro",
             };
             pakkit_detail_opts opts = {
@@ -1286,28 +1695,49 @@ static void show_device_view(void) {
                         }
                         break;
                     case AP_BTN_LEFT:
-                        if (!ev.repeated && g_current_view == VIEW_FRONT) {
-                            int first = first_zone_in_view(VIEW_FRONT);
-                            if (g_selected_zone != first) {
-                                g_selected_zone = first;
-                                g_pulse_start = SDL_GetTicks();
+                        if (!ev.repeated) {
+                            if (g_is_brick) {
+                                /* Brick: L/R only on front view */
+                                if (g_current_view == VIEW_FRONT) {
+                                    int first = first_zone_in_view(VIEW_FRONT);
+                                    if (g_selected_zone != first) {
+                                        g_selected_zone = first;
+                                        g_pulse_start = SDL_GetTicks();
+                                    }
+                                }
+                            } else {
+                                /* Smart Pro: cycle through all zones */
+                                if (g_selected_zone > 0) {
+                                    g_selected_zone--;
+                                    g_pulse_start = SDL_GetTicks();
+                                }
                             }
                         }
                         break;
                     case AP_BTN_RIGHT:
-                        if (!ev.repeated && g_current_view == VIEW_FRONT) {
-                            int last = -1;
-                            for (int i = g_zone_count - 1; i >= 0; i--) {
-                                if (g_zones[i].view == VIEW_FRONT) { last = i; break; }
-                            }
-                            if (last >= 0 && g_selected_zone != last) {
-                                g_selected_zone = last;
-                                g_pulse_start = SDL_GetTicks();
+                        if (!ev.repeated) {
+                            if (g_is_brick) {
+                                if (g_current_view == VIEW_FRONT) {
+                                    int last = -1;
+                                    for (int i = g_zone_count - 1; i >= 0; i--) {
+                                        if (g_zones[i].view == VIEW_FRONT) { last = i; break; }
+                                    }
+                                    if (last >= 0 && g_selected_zone != last) {
+                                        g_selected_zone = last;
+                                        g_pulse_start = SDL_GetTicks();
+                                    }
+                                }
+                            } else {
+                                /* Smart Pro: cycle through all zones */
+                                if (g_selected_zone < g_zone_count - 1) {
+                                    g_selected_zone++;
+                                    g_pulse_start = SDL_GetTicks();
+                                }
                             }
                         }
                         break;
                     case AP_BTN_UP:
-                        if (!ev.repeated && g_current_view == VIEW_BACK) {
+                        if (!ev.repeated && g_is_brick && g_current_view == VIEW_BACK) {
                             int first = first_zone_in_view(VIEW_BACK);
                             if (g_selected_zone != first) {
                                 g_selected_zone = first;
@@ -1316,7 +1746,7 @@ static void show_device_view(void) {
                         }
                         break;
                     case AP_BTN_DOWN:
-                        if (!ev.repeated && g_current_view == VIEW_BACK) {
+                        if (!ev.repeated && g_is_brick && g_current_view == VIEW_BACK) {
                             int last = -1;
                             for (int i = g_zone_count - 1; i >= 0; i--) {
                                 if (g_zones[i].view == VIEW_BACK) { last = i; break; }
@@ -1330,9 +1760,16 @@ static void show_device_view(void) {
                     case AP_BTN_L1:
                     case AP_BTN_R1:
                         if (!ev.repeated) {
-                            g_current_view = (g_current_view == VIEW_FRONT) ? VIEW_BACK : VIEW_FRONT;
-                            g_selected_zone = first_zone_in_view(g_current_view);
-                            g_pulse_start = SDL_GetTicks();
+                            int target_view = (g_current_view == VIEW_FRONT) ? VIEW_BACK : VIEW_FRONT;
+                            /* Only flip if the target view has zones */
+                            if (has_zones_in_view(target_view)) {
+                                g_current_view = target_view;
+                                g_selected_zone = first_zone_in_view(g_current_view);
+                                g_pulse_start = SDL_GetTicks();
+                                /* Pick a new random front image when flipping to front */
+                                if (g_current_view == VIEW_FRONT)
+                                    pick_random_front();
+                            }
                         }
                         break;
                     case AP_BTN_X:
@@ -1347,6 +1784,17 @@ static void show_device_view(void) {
                     case AP_BTN_Y:
                         if (!ev.repeated) {
                             show_menu();
+                        }
+                        break;
+                    case AP_BTN_MENU:
+                        if (!ev.repeated) {
+                            if (all_leds_off()) {
+                                ap_log("LED TOGGLE: turning all LEDs on");
+                                led_toggle_on();
+                            } else {
+                                ap_log("LED TOGGLE: turning all LEDs off");
+                                led_toggle_off();
+                            }
                         }
                         break;
                     default:
@@ -1370,7 +1818,7 @@ static void show_device_view(void) {
         int content_y = pad;
         int content_h = sh - content_y - hint_h - pad;
 
-        SDL_Texture *img = (g_current_view == VIEW_FRONT) ? g_img_front : g_img_back;
+        SDL_Texture *img = (g_current_view == VIEW_FRONT) ? g_img_front_active : g_img_back;
 
         int img_x, img_y, img_w, img_h;
         float img_scale;
@@ -1392,22 +1840,39 @@ static void show_device_view(void) {
             }
         }
 
-        /* Hints */
-        if (g_current_view == VIEW_FRONT) {
+        /* Hints — device-specific layout */
+        /* Toggle hint shows the action (what pressing it will do) */
+        const char *toggle_label = all_leds_off()
+            ? "\xe2\x88\xb4 ON" : "\xe2\x88\xb4 OFF";
+
+        if (g_is_brick) {
+            if (g_current_view == VIEW_FRONT) {
+                pakkit_hint hints[] = {
+                    { .button = toggle_label, .label = "" },
+                    { .button = "B", .label = "Quit" },
+                    { .button = "L/R", .label = "Select" },
+                    { .button = "L1", .label = "Flip" },
+                    { .button = "Y", .label = "Menu" },
+                    { .button = "A", .label = "Edit" },
+                };
+                pakkit_draw_hints(hints, 6);
+            } else {
+                pakkit_hint hints[] = {
+                    { .button = toggle_label, .label = "" },
+                    { .button = "B", .label = "Quit" },
+                    { .button = "U/D", .label = "Select" },
+                    { .button = "L1", .label = "Flip" },
+                    { .button = "Y", .label = "Menu" },
+                    { .button = "A", .label = "Edit" },
+                };
+                pakkit_draw_hints(hints, 6);
+            }
+        } else {
+            /* Smart Pro — no flip, single view */
             pakkit_hint hints[] = {
+                { .button = toggle_label, .label = "" },
                 { .button = "B", .label = "Quit" },
                 { .button = "L/R", .label = "Select" },
-                { .button = "L1/R1", .label = "Flip" },
-                { .button = "Y", .label = "Menu" },
-                { .button = "X", .label = "Save" },
-                { .button = "A", .label = "Edit" },
-            };
-            pakkit_draw_hints(hints, 6);
-        } else {
-            pakkit_hint hints[] = {
-                { .button = "B", .label = "Quit" },
-                { .button = "U/D", .label = "Select" },
-                { .button = "L1/R1", .label = "Flip" },
                 { .button = "Y", .label = "Menu" },
                 { .button = "X", .label = "Save" },
                 { .button = "A", .label = "Edit" },
@@ -1415,7 +1880,6 @@ static void show_device_view(void) {
             pakkit_draw_hints(hints, 6);
         }
 
-        // ap_request_frame();
         ap_present();
     }
 }
@@ -1427,9 +1891,8 @@ static void show_device_view(void) {
 int main(int argc, char *argv[]) {
     (void)argc; (void)argv;
 
-    /* Determine settings path */
-    snprintf(g_settings_path, sizeof(g_settings_path),
-             "/mnt/SDCARD/.userdata/shared/ledsettings_brick.txt");
+    /* Seed random number generator for front image variants */
+    srand((unsigned int)time(NULL));
 
     /* Truncate log */
     const char *log_dir = getenv("LEDOH_LOG_DIR");
@@ -1460,20 +1923,29 @@ int main(int argc, char *argv[]) {
     theme->hint       = (ap_color){ DEFAULT_HINT_R, DEFAULT_HINT_G, DEFAULT_HINT_B, 255 };
 
     ap_log("=== LED'oh! v%s starting ===", LEDOH_VERSION);
-    ap_log("STARTUP: settings path = %s", g_settings_path);
 
-    /* Detect device type */
+    /* Detect device type — must happen before settings path and zone setup */
     char *device = getenv("DEVICE");
     ap_log("STARTUP: DEVICE env = %s", device ? device : "(null)");
     if (device && strcmp(device, "brick") == 0) {
         g_is_brick = 1;
+        g_zones = g_brick_zones;
+        g_zone_count = MAX_ZONES;
+        g_dev_img_w = BRICK_IMG_W;
+        g_dev_img_h = BRICK_IMG_H;
+        snprintf(g_settings_path, sizeof(g_settings_path),
+                 "/mnt/SDCARD/.userdata/shared/ledsettings_brick.txt");
     } else {
-        g_is_brick = 1; /* Default to brick for now */
+        g_is_brick = 0;
+        g_zones = g_smartpro_zones;
+        g_zone_count = SP_ZONE_COUNT;
+        g_dev_img_w = SP_IMG_W;
+        g_dev_img_h = SP_IMG_H;
+        snprintf(g_settings_path, sizeof(g_settings_path),
+                 "/mnt/SDCARD/.userdata/shared/ledsettings.txt");
     }
-    ap_log("STARTUP: is_brick = %d", g_is_brick);
-
-    g_zones = g_brick_zones;
-    g_zone_count = MAX_ZONES;
+    ap_log("STARTUP: is_brick = %d, zone_count = %d", g_is_brick, g_zone_count);
+    ap_log("STARTUP: settings path = %s", g_settings_path);
 
     /* Load device images */
     load_device_images();
@@ -1496,7 +1968,9 @@ int main(int argc, char *argv[]) {
     ap_log("EXIT: LED state restored");
 
     /* Cleanup */
-    if (g_img_front) SDL_DestroyTexture(g_img_front);
+    for (int i = 0; i < FRONT_IMG_COUNT; i++) {
+        if (g_img_front_variants[i]) SDL_DestroyTexture(g_img_front_variants[i]);
+    }
     if (g_img_back) SDL_DestroyTexture(g_img_back);
 
     ap_log("=== LED'oh! shutting down ===");

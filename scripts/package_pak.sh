@@ -30,9 +30,14 @@ mkdir -p "$STAGE_DIR/res"
 cp ports/tg5040/pak/launch.sh "$STAGE_DIR/"
 cp ports/tg5040/pak/pak.json "$STAGE_DIR/"
 cp ports/tg5040/pak/bin/ledoh "$STAGE_DIR/bin/"
-cp ports/tg5040/pak/res/front.png "$STAGE_DIR/res/"
-cp ports/tg5040/pak/res/back.png "$STAGE_DIR/res/"
 cp ports/tg5040/pak/res/font.ttf "$STAGE_DIR/res/"
+
+# Copy all device images (front1-3, smart1-3, back)
+for img in ports/tg5040/pak/res/front*.png \
+           ports/tg5040/pak/res/smart*.png \
+           ports/tg5040/pak/res/back.png; do
+    [ -f "$img" ] && cp "$img" "$STAGE_DIR/res/"
+done
 
 # Copy splash if it exists
 if [ -f ports/tg5040/pak/res/splash.png ]; then
