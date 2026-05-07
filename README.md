@@ -22,7 +22,6 @@ A graphical LED color controller for TrimUI Brick, Brick Hammer, and Smart Pro r
 - **Multi-device support** — Automatically detects Brick, Brick Hammer, or Smart Pro and adapts the UI
 - **Random front images** — Device view randomly picks from available front image variants on each view flip
 - **NextUI compatible** — Reads and writes the same settings file as the built-in LED control
-- **No network required** — Works completely offline
 
 ## LED Zones
 
