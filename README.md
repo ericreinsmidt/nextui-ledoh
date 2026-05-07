@@ -2,11 +2,11 @@
 
 # LED'oh!
 
-**LED color controller for NextUI**
+![LED'oh!](assets/logo.png)
 
-[![Release](https://img.shields.io/github/v/release/ericreinsmidt/nextui-ledoh?style=for-the-badge&color=ff4444)](https://github.com/ericreinsmidt/nextui-ledoh/releases)
-[![Downloads](https://img.shields.io/github/downloads/ericreinsmidt/nextui-ledoh/total?style=for-the-badge&color=ff4444)](https://github.com/ericreinsmidt/nextui-ledoh/releases)
-[![License](https://img.shields.io/github/license/ericreinsmidt/nextui-ledoh?style=for-the-badge&color=ff4444)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/ericreinsmidt/nextui-ledoh?style=for-the-badge&color=dd3333)](https://github.com/ericreinsmidt/nextui-ledoh/releases)
+[![Downloads](https://img.shields.io/github/downloads/ericreinsmidt/nextui-ledoh/total?style=for-the-badge&color=22aa44)](https://github.com/ericreinsmidt/nextui-ledoh/releases)
+[![License](https://img.shields.io/github/license/ericreinsmidt/nextui-ledoh?style=for-the-badge&color=3366cc)](LICENSE)
 
 A graphical LED color controller for TrimUI Brick, Brick Hammer, and Smart Pro running NextUI.
 
