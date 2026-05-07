@@ -45,7 +45,7 @@ if [ -f ports/tg5040/pak/res/splash.png ]; then
 fi
 
 # Create zip
-ZIP_NAME="LED'oh!.tg5040.pak.zip"
+ZIP_NAME="LEDoh.tg5040.pak.zip"
 cd "$DIST_DIR"
 zip -r "$ZIP_NAME" "$PAK_NAME"
 cd ..
