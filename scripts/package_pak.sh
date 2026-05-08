@@ -1,53 +1,54 @@
-#!/bin/bash
-# Package LED'oh! .pak for distribution
-set -e
-cd "$(dirname "$0")/.."
+#!/usr/bin/env bash
+set -euo pipefail
 
-PAK_NAME="LED'oh!.pak"
-DIST_DIR="dist"
-STAGE_DIR="$DIST_DIR/$PAK_NAME"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PLATFORM="tg5040"
+PAK_DIR="$PROJECT_DIR/ports/$PLATFORM/pak"
+DIST_DIR="$PROJECT_DIR/dist"
+PAK_JSON="$PROJECT_DIR/pak.json"
 
-# Read version from pak.json
-VERSION=$(grep '"version"' pak.json | head -1 | sed 's/.*"version"[[:space:]]*:[[:space:]]*"\(.*\)".*/\1/')
-if [ -z "$VERSION" ]; then
-    echo "ERROR: Could not read version from pak.json"
+APP_NAME="$(grep -E '"name"' "$PAK_JSON" | head -n1 | cut -d'"' -f4)"
+RELEASE_FILENAME="$(grep -E '"release_filename"' "$PAK_JSON" | head -n1 | cut -d'"' -f4)"
+
+echo ""
+echo "=== Packaging ${APP_NAME} for ${PLATFORM} ==="
+echo ""
+
+# Validate
+if [ -z "$APP_NAME" ] || [ -z "$RELEASE_FILENAME" ]; then
+    echo "ERROR: Failed to read name or release_filename from pak.json"
     exit 1
 fi
-echo "=== Packaging LED'oh! ${VERSION} ==="
 
-# Check binary exists
-if [ ! -f ports/tg5040/pak/bin/ledoh ]; then
-    echo "ERROR: Binary not found. Run 'make build' first."
+if [ ! -f "$PAK_DIR/bin/ledoh" ]; then
+    echo "ERROR: Binary not found at $PAK_DIR/bin/ledoh — run 'make build' first"
     exit 1
 fi
 
-# Clean and stage
-rm -rf "$DIST_DIR"
-mkdir -p "$STAGE_DIR/bin"
-mkdir -p "$STAGE_DIR/res"
+# Create clean zip via temp dir (excludes .DS_Store)
+mkdir -p "$DIST_DIR"
+TMP_DIR="$DIST_DIR/tmp-package"
+rm -rf "$TMP_DIR"
+mkdir -p "$TMP_DIR"
 
-# Copy files
-cp ports/tg5040/pak/launch.sh "$STAGE_DIR/"
-cp ports/tg5040/pak/pak.json "$STAGE_DIR/"
-cp ports/tg5040/pak/bin/ledoh "$STAGE_DIR/bin/"
-cp ports/tg5040/pak/res/font.ttf "$STAGE_DIR/res/"
+rsync -a --exclude='.DS_Store' "$PAK_DIR/" "$TMP_DIR/"
 
-# Copy all device images (front1-3, smart1-3, back)
-for img in ports/tg5040/pak/res/front*.png \
-           ports/tg5040/pak/res/smart*.png \
-           ports/tg5040/pak/res/back.png; do
-    [ -f "$img" ] && cp "$img" "$STAGE_DIR/res/"
-done
-
-# Copy splash if it exists
-if [ -f ports/tg5040/pak/res/splash.png ]; then
-    cp ports/tg5040/pak/res/splash.png "$STAGE_DIR/res/"
+# Validate
+if [ ! -f "$TMP_DIR/launch.sh" ]; then
+    echo "ERROR: Missing launch.sh in pak directory"
+    rm -rf "$TMP_DIR"
+    exit 1
 fi
 
-# Create zip
-ZIP_NAME="LEDoh.tg5040.pak.zip"
-cd "$DIST_DIR"
-zip -r "$ZIP_NAME" "$PAK_NAME"
-cd ..
+OUTPUT_ZIP="$DIST_DIR/$RELEASE_FILENAME"
+rm -f "$OUTPUT_ZIP"
+cd "$TMP_DIR"
+zip -r "$OUTPUT_ZIP" ./*
+cd "$PROJECT_DIR"
+rm -rf "$TMP_DIR"
 
-echo "=== Package created: $DIST_DIR/$ZIP_NAME ==="
+echo ""
+echo "=== Package complete ==="
+echo "Output: dist/$RELEASE_FILENAME"
+echo ""
