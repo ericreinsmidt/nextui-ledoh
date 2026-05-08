@@ -1,7 +1,7 @@
 # TrimUI Brick — Per-LED Hardware Research
 
 - **Date:** May 7–8, 2026
-- **Researcher:** Eric Reinsmidt using Claude
+- **Author:** Eric Reinsmidt using Claude
 - **Device:** TrimUI Brick (tg5040)
 - **Firmware:** Stock (stable NextUI)
 - **Method:** Physical teardown + iterative sysfs testing via SSH terminal
