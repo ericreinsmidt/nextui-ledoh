@@ -118,6 +118,10 @@ make clean      # Remove build artifacts
 
 The binary is cross-compiled using the `ghcr.io/loveretro/tg5040-toolchain` Docker image. No local cross-compiler setup required.
 
+## Hardware Research
+
+See [brick_led_research.md](brick_led_research.md) for per-LED framebuffer findings on the TrimUI Brick (14 individually addressable LEDs via `frame_hex`).
+
 ## Credits
 
 - Built with [PakKit](https://github.com/ericreinsmidt/pakkit) and [Apostrophe](https://github.com/Helaas/Apostrophe)
