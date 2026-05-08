@@ -266,7 +266,7 @@ done
 
 ## Confirmed Working: Rainbow Chase (Top Bar + Triggers)
 
-12-LED rainbow chase spanning top bar and trigger LEDs, skipping F1/F2. **Not yet confirmed on device** — uses `${C10}`, `${C11}`, `${C12}` shell variable syntax which may not work on the device's `sh`.
+12-LED rainbow chase spanning top bar and trigger LEDs, skipping F1/F2.
 
 ### Script (untested)
 ```bash
@@ -321,7 +321,7 @@ done
 
 ## Confirmed Working: Rainbow Chase (All 14 LEDs)
 
-Full-device rainbow chase across all 14 LEDs in clockwise physical order. **Not yet confirmed on device** — uses `build_frame` function with `${11}`+ positional parameters which may not work on the device's `sh`.
+Full-device rainbow chase across all 14 LEDs in clockwise physical order. 
 
 ### Script (untested)
 ```bash
