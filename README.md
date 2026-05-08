@@ -120,7 +120,7 @@ The binary is cross-compiled using the `ghcr.io/loveretro/tg5040-toolchain` Dock
 
 ## Hardware Research
 
-See [brick_led_research.md](brick_led_research.md) for per-LED framebuffer findings on the TrimUI Brick (14 individually addressable LEDs via `frame_hex`).
+See [trimui_brick_led_research.md](trimui_brick_led_research.md) for per-LED framebuffer findings on the TrimUI Brick (14 individually addressable LEDs via `frame_hex`).
 
 ## Credits
 
