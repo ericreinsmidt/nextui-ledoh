@@ -1,4 +1,4 @@
-# TrimUI Brick — Per-LED Hardware Research
+# TrimUI Brick — Per-LED Hardware
 
 - **Date:** May 7–8, 2026
 - **Author:** Eric Reinsmidt using Claude
