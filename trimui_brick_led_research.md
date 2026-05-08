@@ -127,12 +127,12 @@ Toggle `effect_enable` back to 1 and then to 0 between each frame write. This cl
 ```bash
 # Setup (once)
 echo 80 > /sys/class/led_anim/max_scale
-echo 80 > /sys/class/led_anim/max_scale_f1f2      # if using f1/f2
-echo 80 > /sys/class/led_anim/max_scale_lr         # if using triggers
-echo "000000 " > /sys/class/led_anim/effect_rgb_hex_m   # prevent flash
-echo "000000 " > /sys/class/led_anim/effect_rgb_hex_f1  # prevent flash
-echo "000000 " > /sys/class/led_anim/effect_rgb_hex_f2  # prevent flash
-echo "000000 " > /sys/class/led_anim/effect_rgb_hex_lr  # prevent flash
+echo 80 > /sys/class/led_anim/max_scale_f1f2              # if using f1/f2
+echo 80 > /sys/class/led_anim/max_scale_lr                # if using triggers
+echo "000000 " > /sys/class/led_anim/effect_rgb_hex_m     # prevent flash
+echo "000000 " > /sys/class/led_anim/effect_rgb_hex_f1    # prevent flash
+echo "000000 " > /sys/class/led_anim/effect_rgb_hex_f2    # prevent flash
+echo "000000 " > /sys/class/led_anim/effect_rgb_hex_lr    # prevent flash
 echo 4 > /sys/class/led_anim/effect_m
 echo 4 > /sys/class/led_anim/effect_f1
 echo 4 > /sys/class/led_anim/effect_f2
@@ -141,10 +141,10 @@ echo 0 > /sys/class/led_anim/effect_enable
 sleep 0.3
 
 # Per-frame (repeat)
-echo "RRGGBB RRGGBB ... " > /sys/class/led_anim/frame_hex   # write frame
-sleep $FRAME_DELAY                                             # hold frame
-echo 1 > /sys/class/led_anim/effect_enable                    # clear block
-echo 0 > /sys/class/led_anim/effect_enable                    # re-disable for next write
+echo "RRGGBB RRGGBB ... " > /sys/class/led_anim/frame_hex  # write frame
+sleep $FRAME_DELAY                                         # hold frame
+echo 1 > /sys/class/led_anim/effect_enable                 # clear block
+echo 0 > /sys/class/led_anim/effect_enable                 # re-disable for next write
 
 # Cleanup (once, on exit)
 echo 1 > /sys/class/led_anim/effect_enable
