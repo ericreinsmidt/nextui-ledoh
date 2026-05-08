@@ -8,7 +8,7 @@
 
 ---
 
-## Executive Summary
+## Summary
 
 The TrimUI Brick has **14 individually addressable RGB LEDs** accessible via a single sysfs interface (`frame_hex`). The existing zone-based effect system (`effect_*`) groups these into 4 logical zones, but `frame_hex` bypasses zoning entirely and gives per-LED color control. Animation is possible via a toggle workaround that clears a driver write-block between frames.
 
