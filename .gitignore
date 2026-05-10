@@ -17,3 +17,6 @@ dist/
 .vscode/
 *.swp
 *.swo
+
+# Claude Code
+.claude/

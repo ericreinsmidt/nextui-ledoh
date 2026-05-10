@@ -18,9 +18,10 @@ A graphical LED color controller for TrimUI Brick, Brick Hammer, and Smart Pro r
 - **2D HSL color picker** — Full-screen color field with crosshair cursor and live hardware preview
 - **Per-zone settings** — Brightness, effect type, and animation speed for each LED zone
 - **Real-time feedback** — Physical LEDs update instantly as you pick colors and adjust settings
-- **LED toggle** — Quickly turn all LEDs off or on with the ∴ button
+- **Per-LED animations** — 15 animated LED patterns using per-LED frame control (Brick only)
+- **Persistent animations** — Animations survive app exit and device reboots
 - **Multi-device support** — Automatically detects Brick, Brick Hammer, or Smart Pro and adapts the UI
-- **Random front images** — Device view randomly picks from available front image variants on each view flip
+- **Random front images** — Device view randomly picks from available front image variants on each view flip (app start for Smart Pro)
 - **NextUI compatible** — Reads and writes the same settings file as the built-in LED control
 
 ## LED Zones
@@ -65,10 +66,8 @@ A graphical LED color controller for TrimUI Brick, Brick Hammer, and Smart Pro r
 | D-pad U/D | Select zone (back view, Brick only) |
 | L1/R1 | Switch front/back view (Brick only) |
 | A | Open color picker for selected zone |
-| X | Quick save |
-| Y | Menu (zone settings, reset, about) |
-| ∴ | Toggle all LEDs off/on |
-| B | Quit (prompts to save if unsaved changes) |
+| Y | Menu (zone settings, animations, about) |
+| B | Save and quit |
 
 ### Color Picker
 
@@ -87,6 +86,30 @@ A graphical LED color controller for TrimUI Brick, Brick Hammer, and Smart Pro r
 | L1/R1 + L/R | Fast adjust |
 | A | Confirm |
 | B | Cancel (restore original values) |
+
+## Animations (Brick Only)
+
+15 per-LED animation patterns that drive the Brick's 14 individually addressable LEDs via the `frame_hex` framebuffer. Animations run as background daemons that persist after the app exits and automatically restart on reboot.
+
+Select animations from **Y → Menu → Animations**. While an animation is running, editing zone colors will pause the animation and resume it when you're done.
+
+| Animation | Description |
+|-----------|-------------|
+| Aurora | Slow-drifting greens, teals, and purples |
+| K.I.T.T. | Classic Knight Rider red sweep |
+| Campfire | Flickering warm firelight |
+| EKG | Heartbeat pulse sweep |
+| Ocean | Rolling blue-green waves |
+| Comet | Bright head with fading tail |
+| Starfield | Twinkling random stars |
+| Morse (NEXTUI) | Blinks "NEXTUI" in Morse code |
+| Police | Red and blue alternating flash |
+| Pride | Rainbow flag color chase |
+| 'Murica! | Red, white, and blue chase |
+| Festivus | Red and green holiday chase |
+| Halloween | Orange and purple chase |
+| Binary | Binary counter in LEDs |
+| Fibonacci | Golden spiral build and fade |
 
 ## Installation
 
