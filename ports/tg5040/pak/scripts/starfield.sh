@@ -1,4 +1,5 @@
 #!/bin/sh
+# NAME: Starfield
 # Starfield — TrimUI Brick per-LED animation
 # Random LEDs twinkle white against darkness
 #

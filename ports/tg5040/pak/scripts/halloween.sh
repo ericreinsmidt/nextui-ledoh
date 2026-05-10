@@ -1,4 +1,5 @@
 #!/bin/sh
+# NAME: Halloween
 # Halloween — TrimUI Brick per-LED animation
 # Spooky orange and purple with occasional white lightning flash
 # Triggers hold eerie green, F1/F2 dim purple

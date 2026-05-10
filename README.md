@@ -89,9 +89,13 @@ A graphical LED color controller for TrimUI Brick, Brick Hammer, and Smart Pro r
 
 ## Animations (Brick Only)
 
-15 per-LED animation patterns that drive the Brick's 14 individually addressable LEDs via the `frame_hex` framebuffer. Animations run as background daemons that persist after the app exits and automatically restart on reboot.
+Per-LED animation patterns that drive the Brick's 14 individually addressable LEDs via the `frame_hex` framebuffer. Animations run as background daemons that persist after the app exits and automatically restart on reboot.
 
 Select animations from **Y → Menu → Animations**. While an animation is running, editing zone colors will pause the animation and resume it when you're done.
+
+Animations are discovered dynamically from the `scripts/` folder inside the pak directory. You can add your own — see [Creating Custom Animations](#creating-custom-animations) below.
+
+### Included Animations
 
 | Animation | Description |
 |-----------|-------------|
@@ -99,6 +103,7 @@ Select animations from **Y → Menu → Animations**. While an animation is runn
 | K.I.T.T. | Classic Knight Rider red sweep |
 | Campfire | Flickering warm firelight |
 | EKG | Heartbeat pulse sweep |
+| Lava Lamp | Slow, blobby warm color blobs rising |
 | Ocean | Rolling blue-green waves |
 | Comet | Bright head with fading tail |
 | Starfield | Twinkling random stars |
@@ -110,6 +115,106 @@ Select animations from **Y → Menu → Animations**. While an animation is runn
 | Halloween | Orange and purple chase |
 | Binary | Binary counter in LEDs |
 | Fibonacci | Golden spiral build and fade |
+
+### Creating Custom Animations
+
+Drop any `.sh` file into the `scripts/` folder inside the LED'oh! pak directory and it will automatically appear in the Animations menu. No recompilation needed.
+
+**Location:** `Tools/tg5040/LED'oh!.pak/scripts/`
+
+**Requirements:**
+
+1. The script must be a POSIX shell script (starts with `#!/bin/sh`)
+2. Add a `# NAME: Your Animation Name` line in the first 5 lines to set the display name (otherwise the filename is used)
+3. The script must write all **14 LED positions** in every frame to avoid stale colors bleeding through
+4. Use PID file management so the app can detect and stop your animation
+
+**LED positions in frame_hex (space-separated hex colors):**
+
+```
+Position:  1    2    3    4    5    6    7    8    9    10   11   12   13   14
+Zone:      |---------- Top Bar (8) ----------|  F2   F1   |-- L Trig --|-- R Trig --|
+```
+
+All 14 positions must be written in every frame, even if unused (set unused positions to `000000`).
+
+**Template:**
+
+```sh
+#!/bin/sh
+# NAME: My Animation
+# Description of what it does
+#
+# Daemon-ready: writes PID to /tmp/led_anim.pid for external management
+
+F="/sys/class/led_anim/frame_hex"
+E="/sys/class/led_anim/effect_enable"
+PIDFILE="/tmp/led_anim.pid"
+SPEED=0.10  # seconds between frames
+
+# --- PID management (required) ---
+if [ -f "$PIDFILE" ]; then
+    OLD_PID=$(cat "$PIDFILE")
+    if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+        kill "$OLD_PID" 2>/dev/null
+        sleep 0.5
+    fi
+    rm -f "$PIDFILE"
+fi
+echo $$ > "$PIDFILE"
+
+# --- Setup (required) ---
+# Set brightness for each zone (0-100)
+echo 80 > /sys/class/led_anim/max_scale          # Top bar
+echo 50 > /sys/class/led_anim/max_scale_f1f2     # FN1/FN2 buttons
+echo 50 > /sys/class/led_anim/max_scale_lr       # L/R triggers
+# Clear the effect system so frame_hex has full control
+echo "000000 " > /sys/class/led_anim/effect_rgb_hex_m
+echo "000000 " > /sys/class/led_anim/effect_rgb_hex_f1
+echo "000000 " > /sys/class/led_anim/effect_rgb_hex_f2
+echo "000000 " > /sys/class/led_anim/effect_rgb_hex_lr
+echo 0 > /sys/class/led_anim/effect_m
+echo 0 > /sys/class/led_anim/effect_f1
+echo 0 > /sys/class/led_anim/effect_f2
+echo 0 > /sys/class/led_anim/effect_lr
+echo 0 > "$E"
+sleep 0.3
+
+# --- Cleanup on exit (required) ---
+cleanup() {
+    rm -f "$PIDFILE"
+    echo 1 > "$E"
+    echo 4 > /sys/class/led_anim/effect_m
+    echo -1 > /sys/class/led_anim/effect_cycles_m
+    echo 50 > /sys/class/led_anim/max_scale
+    echo 50 > /sys/class/led_anim/max_scale_f1f2
+    echo 50 > /sys/class/led_anim/max_scale_lr
+    exit 0
+}
+trap cleanup INT TERM HUP
+
+# --- Write one frame (required) ---
+write_frame() {
+    echo "$1 " > "$F"
+    sleep $SPEED
+    echo 1 > "$E"
+    echo 0 > "$E"
+}
+
+# --- Your animation loop ---
+while true; do
+    # Build your frame as 14 space-separated 6-digit hex colors (RRGGBB)
+    # Top bar (8) + F2 + F1 + TL + TL2 + TR2 + TR
+    write_frame "FF0000 00FF00 0000FF FF0000 00FF00 0000FF FF0000 00FF00 000000 000000 000000 000000 000000 000000"
+done
+```
+
+**Tips:**
+- Colors are 6-digit hex (RRGGBB): `FF0000` = red, `00FF00` = green, `000000` = off
+- `SPEED` controls frame timing — lower is faster (0.08 = fast, 0.20 = slow)
+- Use shell arithmetic for patterns: `$(( step % 8 ))` for cycling
+- The `write_frame` function handles the effect_enable toggle that flushes frame data to hardware
+- Set `max_scale` to 0 for zones you want completely off (overrides any color)
 
 ## Installation
 

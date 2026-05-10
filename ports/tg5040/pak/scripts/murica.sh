@@ -1,4 +1,5 @@
 #!/bin/sh
+# NAME: 'Murica!
 # 'Murica! — TrimUI Brick per-LED animation
 # Red, white, and blue chase across the top bar
 # Triggers flash red and blue, F1/F2 hold white

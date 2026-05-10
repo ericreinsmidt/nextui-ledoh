@@ -22,12 +22,13 @@
 #include <stdlib.h>
 #include <time.h>
 #include <signal.h>
+#include <dirent.h>
 
 /* -----------------------------------------------------------------------
  * Constants
  * ----------------------------------------------------------------------- */
 
-#define LEDOH_VERSION    "0.4.0"
+#define LEDOH_VERSION    "0.5.0"
 #define MAX_PATH_LEN     1280
 #define MAX_ZONES        4
 #define MAX_LINE         512
@@ -155,8 +156,8 @@ typedef struct {
 
 /* Animation definition */
 typedef struct {
-    const char *name;       /* Display name: "Aurora Borealis" */
-    const char *script;     /* Script filename: "aurora.sh" */
+    char name[64];          /* Display name parsed from "# NAME:" header */
+    char script[64];        /* Script filename: "aurora.sh" */
 } anim_def_t;
 
 /* LED operating mode */
@@ -166,28 +167,16 @@ typedef enum {
 } led_mode_t;
 
 /* -----------------------------------------------------------------------
- * Animation definitions (Brick only)
+ * Animation list — discovered at runtime from scripts directory
+ * Each .sh file in <pak_dir>/scripts/ is an animation.
+ * Display name is read from a "# NAME: ..." header line in the script.
+ * Falls back to the filename (without .sh) if no NAME header is found.
  * ----------------------------------------------------------------------- */
 
-#define ANIM_COUNT  15
+#define MAX_ANIMATIONS  64
 
-static const anim_def_t g_animations[ANIM_COUNT] = {
-    { "Aurora",             "aurora.sh"    },
-    { "K.I.T.T.",           "kitt.sh"      },
-    { "Campfire",           "campfire.sh"  },
-    { "EKG",                "heartbeat.sh" },
-    { "Ocean",              "ocean.sh"     },
-    { "Comet",              "comet.sh"     },
-    { "Starfield",          "starfield.sh" },
-    { "Morse (NEXTUI)",     "morse.sh"     },
-    { "Police",             "police.sh"    },
-    { "Pride",              "pride.sh"     },
-    { "'Murica!",           "murica.sh"    },
-    { "Festivus",           "festivus.sh"  },
-    { "Halloween",          "halloween.sh" },
-    { "Binary",             "binary.sh"    },
-    { "Fibonacci",          "fibonacci.sh" },
-};
+static anim_def_t g_animations[MAX_ANIMATIONS];
+static int        g_anim_count = 0;
 
 /* -----------------------------------------------------------------------
  * Zone definitions — Brick / Brick Hammer
@@ -398,6 +387,100 @@ static void sync_brightness_after_change(int zone_idx) {
 }
 
 /* -----------------------------------------------------------------------
+ * Animation discovery — scan scripts directory at runtime
+ * ----------------------------------------------------------------------- */
+
+/* Compare animation entries by name for qsort (case-insensitive) */
+static int anim_cmp(const void *a, const void *b) {
+    return strcasecmp(((const anim_def_t *)a)->name,
+                      ((const anim_def_t *)b)->name);
+}
+
+/* Scan the scripts directory for .sh files and populate g_animations[].
+ * Each script can declare a display name via a "# NAME: ..." line
+ * in its first 5 lines.  Falls back to the filename without extension. */
+static void anim_scan_scripts(void) {
+    const char *pak_dir = getenv("LEDOH_PAK_DIR");
+    if (!pak_dir) {
+        ap_log("ANIM SCAN: LEDOH_PAK_DIR not set, no animations available");
+        return;
+    }
+
+    char scripts_dir[MAX_PATH_LEN];
+    snprintf(scripts_dir, sizeof(scripts_dir), "%s/scripts", pak_dir);
+
+    DIR *dir = opendir(scripts_dir);
+    if (!dir) {
+        ap_log("ANIM SCAN: cannot open %s: %s", scripts_dir, strerror(errno));
+        return;
+    }
+
+    g_anim_count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL && g_anim_count < MAX_ANIMATIONS) {
+        /* Copy filename into a fixed-size buffer for safe handling */
+        char fname[64];
+        size_t len = strlen(entry->d_name);
+        if (len < 4 || len >= sizeof(fname)) continue;
+        memcpy(fname, entry->d_name, len + 1);
+
+        /* Must end in .sh and not be hidden */
+        if (strcmp(fname + len - 3, ".sh") != 0) continue;
+        if (fname[0] == '.') continue;
+
+        /* Try to read "# NAME: ..." from the first 5 lines of the script */
+        char script_path[MAX_PATH_LEN + 80];
+        snprintf(script_path, sizeof(script_path), "%s/%s", scripts_dir, fname);
+
+        char display_name[64] = {0};
+        FILE *f = fopen(script_path, "r");
+        if (f) {
+            char line[256];
+            for (int i = 0; i < 5 && fgets(line, sizeof(line), f); i++) {
+                /* Look for "# NAME: <display name>" */
+                if (strncmp(line, "# NAME:", 7) == 0) {
+                    char *name_start = line + 7;
+                    while (*name_start == ' ') name_start++;
+                    snprintf(display_name, sizeof(display_name), "%s", name_start);
+                    /* Trim trailing whitespace */
+                    size_t nlen = strlen(display_name);
+                    while (nlen > 0 && (display_name[nlen-1] == '\n' ||
+                           display_name[nlen-1] == '\r' ||
+                           display_name[nlen-1] == ' '))
+                        display_name[--nlen] = '\0';
+                    break;
+                }
+            }
+            fclose(f);
+        }
+
+        /* Fall back to filename without .sh extension */
+        if (display_name[0] == '\0') {
+            snprintf(display_name, sizeof(display_name), "%.*s",
+                     (int)(len - 3), fname);
+            /* Capitalize first letter */
+            if (display_name[0] >= 'a' && display_name[0] <= 'z')
+                display_name[0] -= 32;
+        }
+
+        anim_def_t *anim = &g_animations[g_anim_count];
+        snprintf(anim->script, sizeof(anim->script), "%s", fname);
+        snprintf(anim->name, sizeof(anim->name), "%s", display_name);
+        g_anim_count++;
+
+        ap_log("ANIM SCAN: found %s → \"%s\"", fname, display_name);
+    }
+
+    closedir(dir);
+
+    /* Sort alphabetically by display name */
+    if (g_anim_count > 0)
+        qsort(g_animations, g_anim_count, sizeof(anim_def_t), anim_cmp);
+
+    ap_log("ANIM SCAN: %d animations discovered in %s", g_anim_count, scripts_dir);
+}
+
+/* -----------------------------------------------------------------------
  * Animation management (Brick only)
  * ----------------------------------------------------------------------- */
 
@@ -451,7 +534,7 @@ static int anim_get_running_index(void) {
     }
 
     /* Match against known script filenames */
-    for (int i = 0; i < ANIM_COUNT; i++) {
+    for (int i = 0; i < g_anim_count; i++) {
         if (strstr(cmdline, g_animations[i].script) != NULL) {
             ap_log("ANIM: running animation detected: %s (pid %d)",
                    g_animations[i].name, (int)pid);
@@ -510,7 +593,7 @@ static void anim_stop(void) {
 
 /* Start an animation by index */
 static void anim_start(int anim_idx) {
-    if (anim_idx < 0 || anim_idx >= ANIM_COUNT) return;
+    if (anim_idx < 0 || anim_idx >= g_anim_count) return;
 
     const char *pak_dir = getenv("LEDOH_PAK_DIR");
     if (!pak_dir) {
@@ -613,7 +696,7 @@ static void anim_save_config(int anim_idx) {
         return;
     }
 
-    if (anim_idx >= 0 && anim_idx < ANIM_COUNT) {
+    if (anim_idx >= 0 && anim_idx < g_anim_count) {
         fprintf(f, "%s\n", g_animations[anim_idx].script);
         ap_log("ANIM CONFIG: saved %s to %s", g_animations[anim_idx].script, path);
     } else {
@@ -652,7 +735,7 @@ static int anim_load_config(void) {
     }
 
     /* Match against known script filenames */
-    for (int i = 0; i < ANIM_COUNT; i++) {
+    for (int i = 0; i < g_anim_count; i++) {
         if (strcmp(line, g_animations[i].script) == 0) {
             ap_log("ANIM CONFIG: loaded %s (index %d)", g_animations[i].name, i);
             return i;
@@ -1891,9 +1974,9 @@ static void show_color_picker(int zone_idx) {
 
 static void show_animations_menu(void) {
     /* Build list items: "Off" + all animations */
-    int item_count = ANIM_COUNT + 1;
-    pakkit_list_item items[ANIM_COUNT + 1];
-    char labels[ANIM_COUNT + 1][128];
+    int item_count = g_anim_count + 1;
+    pakkit_list_item items[g_anim_count + 1];
+    char labels[g_anim_count + 1][128];
 
     int running_idx = anim_get_running_index();
 
@@ -1912,7 +1995,7 @@ static void show_animations_menu(void) {
     items[0].label = labels[0];
 
     /* Animation items */
-    for (int i = 0; i < ANIM_COUNT; i++) {
+    for (int i = 0; i < g_anim_count; i++) {
         if (i == running_idx) {
             snprintf(labels[i + 1], sizeof(labels[i + 1]), "%s  \xe2\x9c\x93",
                      g_animations[i].name);
@@ -1978,9 +2061,9 @@ static void show_menu(void) {
     char zone_settings_label[128];
     snprintf(zone_settings_label, sizeof(zone_settings_label), "%s Settings", g_zones[g_selected_zone].name);
 
-    /* Build menu items — animations only on Brick.
+    /* Build menu items — animations only on Brick when scripts are available.
      * When an animation is active, hide zone settings/reset (they're irrelevant). */
-    if (g_is_brick) {
+    if (g_is_brick && g_anim_count > 0) {
         int anim_active = (g_led_mode == MODE_ANIMATION);
         char anim_label[128];
         if (anim_active) {
@@ -2450,6 +2533,10 @@ int main(int argc, char *argv[]) {
     }
     ap_log("STARTUP: is_brick = %d, zone_count = %d", g_is_brick, g_zone_count);
     ap_log("STARTUP: settings path = %s", g_settings_path);
+
+    /* Discover animation scripts (Brick only) */
+    if (g_is_brick)
+        anim_scan_scripts();
 
     /* Load device images */
     load_device_images();

@@ -1,4 +1,5 @@
 #!/bin/sh
+# NAME: Comet
 # Comet — TrimUI Brick per-LED animation
 # Bright white head with blue fading tail
 # Wraps around all 14 LEDs

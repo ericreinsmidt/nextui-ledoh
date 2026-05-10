@@ -1,4 +1,5 @@
 #!/bin/sh
+# NAME: Police
 # Police Lights — TrimUI Brick per-LED animation
 # Alternating red/blue flash across all 14 LEDs
 #

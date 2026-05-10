@@ -1,4 +1,5 @@
 #!/bin/sh
+# NAME: Fibonacci
 # Fibonacci — TrimUI Brick per-LED animation
 # LEDs light up at fibonacci positions, then shift and evolve
 # Golden/amber color scheme — mathematical beauty

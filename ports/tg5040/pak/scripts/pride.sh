@@ -1,4 +1,5 @@
 #!/bin/sh
+# NAME: Pride
 # Pride Rainbow — TrimUI Brick per-LED animation
 # Classic 6-color rainbow flag chase across the top bar
 # Top bar only — F1/F2 and triggers off

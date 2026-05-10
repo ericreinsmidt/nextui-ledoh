@@ -1,4 +1,5 @@
 #!/bin/sh
+# NAME: K.I.T.T.
 # K.I.T.T. Scanner — TrimUI Brick per-LED animation
 # Classic Knight Rider red sweep with brightness tail — top bar only
 #

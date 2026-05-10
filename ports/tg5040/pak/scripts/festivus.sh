@@ -1,4 +1,5 @@
 #!/bin/sh
+# NAME: Festivus
 # Festivus — TrimUI Brick per-LED animation
 # Alternating red and green with gentle twinkling
 # F1/F2 hold warm white, triggers alternate red/green

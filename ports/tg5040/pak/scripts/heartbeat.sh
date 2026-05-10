@@ -1,4 +1,5 @@
 #!/bin/sh
+# NAME: EKG
 # Heartbeat Monitor — TrimUI Brick per-LED animation
 # EKG-style blip sweeps across the top bar against a dim baseline
 # All LEDs hold a dim glow, bright green blip travels left to right
