@@ -2,7 +2,7 @@
 # NAME: EKG
 # Heartbeat Monitor — TrimUI Brick per-LED animation
 # EKG-style blip sweeps across the top bar against a dim baseline
-# All LEDs hold a dim glow, bright green blip travels left to right
+# All LEDs hold a dim glow, bright green blip travels right to left
 # Pause between beats like a real heart monitor
 #
 # Daemon-ready: writes PID to /tmp/led_anim.pid for external management
@@ -79,26 +79,26 @@ while true; do
     # --- Flat baseline (pre-beat) ---
     write_frame "$BASE" "$REST"
 
-    # --- Blip sweeps left to right across top bar ---
-    # pos 1: blip at LED 1
-    write_frame "$B $DIM $DIM $DIM $DIM $DIM $DIM $DIM $DDIM $DDIM $DDIM $DDIM $DDIM $DDIM" "$SWEEP"
-    # pos 2
-    write_frame "$T1 $B $DIM $DIM $DIM $DIM $DIM $DIM $DDIM $DDIM $DDIM $DDIM $DDIM $DDIM" "$SWEEP"
-    # pos 3 — building up to the spike
-    write_frame "$T2 $T1 $B $DIM $DIM $DIM $DIM $DIM $DDIM $DDIM $DDIM $DDIM $DDIM $DDIM" "$SWEEP"
-    # pos 4 — THE SPIKE — all LEDs flash bright
-    write_frame "$T2 $T2 $T1 $B $B $DIM $DIM $DIM $B $B $T1 $T2 $T2 $T1" "$SWEEP"
-    # pos 5 — spike falloff
-    write_frame "$DIM $T2 $T2 $T1 $B $DIM $DIM $DIM $T2 $T2 $DDIM $DDIM $DDIM $DDIM" "$SWEEP"
-    # pos 6
-    write_frame "$DIM $DIM $T2 $T2 $T1 $B $DIM $DIM $DDIM $DDIM $DDIM $DDIM $DDIM $DDIM" "$SWEEP"
+    # --- Blip sweeps right to left across top bar ---
+    # pos 8: blip at LED 8
+    write_frame "$DIM $DIM $DIM $DIM $DIM $DIM $DIM $B $DDIM $DDIM $DDIM $DDIM $DDIM $DDIM" "$SWEEP"
     # pos 7
-    write_frame "$DIM $DIM $DIM $T2 $T2 $T1 $B $DIM $DDIM $DDIM $DDIM $DDIM $DDIM $DDIM" "$SWEEP"
-    # pos 8
-    write_frame "$DIM $DIM $DIM $DIM $T2 $T2 $T1 $B $DDIM $DDIM $DDIM $DDIM $DDIM $DDIM" "$SWEEP"
+    write_frame "$DIM $DIM $DIM $DIM $DIM $DIM $B $T1 $DDIM $DDIM $DDIM $DDIM $DDIM $DDIM" "$SWEEP"
+    # pos 6 — building up to the spike
+    write_frame "$DIM $DIM $DIM $DIM $DIM $B $T1 $T2 $DDIM $DDIM $DDIM $DDIM $DDIM $DDIM" "$SWEEP"
+    # pos 5 — THE SPIKE — all LEDs flash bright
+    write_frame "$DIM $DIM $DIM $B $B $T1 $T2 $T2 $B $B $T1 $T2 $T2 $T1" "$SWEEP"
+    # pos 4 — spike falloff
+    write_frame "$DIM $DIM $DIM $B $T1 $T2 $T2 $DIM $T2 $T2 $DDIM $DDIM $DDIM $DDIM" "$SWEEP"
+    # pos 3
+    write_frame "$DIM $DIM $B $T1 $T2 $T2 $DIM $DIM $DDIM $DDIM $DDIM $DDIM $DDIM $DDIM" "$SWEEP"
+    # pos 2
+    write_frame "$DIM $B $T1 $T2 $T2 $DIM $DIM $DIM $DDIM $DDIM $DDIM $DDIM $DDIM $DDIM" "$SWEEP"
+    # pos 1
+    write_frame "$B $T1 $T2 $T2 $DIM $DIM $DIM $DIM $DDIM $DDIM $DDIM $DDIM $DDIM $DDIM" "$SWEEP"
     # fade out
-    write_frame "$DIM $DIM $DIM $DIM $DIM $T2 $T2 $T1 $DDIM $DDIM $DDIM $DDIM $DDIM $DDIM" "$SWEEP"
-    write_frame "$DIM $DIM $DIM $DIM $DIM $DIM $T2 $T2 $DDIM $DDIM $DDIM $DDIM $DDIM $DDIM" "$SWEEP"
+    write_frame "$T1 $T2 $T2 $DIM $DIM $DIM $DIM $DIM $DDIM $DDIM $DDIM $DDIM $DDIM $DDIM" "$SWEEP"
+    write_frame "$T2 $T2 $DIM $DIM $DIM $DIM $DIM $DIM $DDIM $DDIM $DDIM $DDIM $DDIM $DDIM" "$SWEEP"
     # back to baseline
     write_frame "$BASE" "$SWEEP"
 done

@@ -18,7 +18,8 @@ A graphical LED color controller for TrimUI Brick, Brick Hammer, and Smart Pro r
 - **2D HSL color picker** — Full-screen color field with crosshair cursor and live hardware preview
 - **Per-zone settings** — Brightness, effect type, and animation speed for each LED zone
 - **Real-time feedback** — Physical LEDs update instantly as you pick colors and adjust settings
-- **Per-LED animations** — 15 animated LED patterns using per-LED frame control (Brick only)
+- **LEDs Off/On toggle** — Turn all LEDs off with a single button press; toggle back on to resume your previous state (static colors or running animation)
+- **Per-LED animations** — 11 animated LED patterns using per-LED frame control (Brick only)
 - **Persistent animations** — Animations survive app exit and device reboots
 - **Multi-device support** — Automatically detects Brick, Brick Hammer, or Smart Pro and adapts the UI
 - **Random front images** — Device view randomly picks from available front image variants on each view flip (app start for Smart Pro)
@@ -67,6 +68,7 @@ A graphical LED color controller for TrimUI Brick, Brick Hammer, and Smart Pro r
 | L1/R1 | Switch front/back view (Brick only) |
 | A | Open color picker for selected zone |
 | Y | Menu (zone settings, animations, about) |
+| Menu | Toggle LEDs off/on |
 | B | Save and quit |
 
 ### Color Picker
@@ -100,21 +102,16 @@ Animations are discovered dynamically from the `scripts/` folder inside the pak 
 | Animation | Description |
 |-----------|-------------|
 | Aurora | Slow-drifting greens, teals, and purples |
-| K.I.T.T. | Classic Knight Rider red sweep |
+| Binary | Binary counter in LEDs |
 | Campfire | Flickering warm firelight |
-| EKG | Heartbeat pulse sweep |
-| Lava Lamp | Slow, blobby warm color blobs rising |
-| Ocean | Rolling blue-green waves |
 | Comet | Bright head with fading tail |
-| Starfield | Twinkling random stars |
-| Morse (NEXTUI) | Blinks "NEXTUI" in Morse code |
+| EKG | Heartbeat pulse sweep |
+| K.I.T.T. | Classic Knight Rider red sweep |
+| Kessel Run | Stars streak outward from center to lightspeed |
+| Morse | Blinks "NEXTUI" in Morse code |
+| Ocean | Rolling blue-green waves |
 | Police | Red and blue alternating flash |
 | Pride | Rainbow flag color chase |
-| 'Murica! | Red, white, and blue chase |
-| Festivus | Red and green holiday chase |
-| Halloween | Orange and purple chase |
-| Binary | Binary counter in LEDs |
-| Fibonacci | Golden spiral build and fade |
 
 ### Creating Custom Animations
 

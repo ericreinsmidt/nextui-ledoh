@@ -121,11 +121,6 @@
 /* Animation PID file — shared with animation shell scripts */
 #define ANIM_PID_FILE    "/tmp/led_anim.pid"
 
-/* Animation config file — persists selected animation across launches */
-#define ANIM_CONFIG_FILE "anim_config"
-
-/* Backup of LED settings while animation runs (real colors, not black) */
-#define SETTINGS_BACKUP_SUFFIX ".anim_backup"
 
 /* -----------------------------------------------------------------------
  * Data structures
@@ -162,8 +157,9 @@ typedef struct {
 
 /* LED operating mode */
 typedef enum {
-    MODE_STATIC,     /* Normal per-zone effect settings (includes "off" = brightness 0) */
+    MODE_STATIC,     /* Normal per-zone effect settings */
     MODE_ANIMATION,  /* Script daemon running */
+    MODE_OFF,        /* All LEDs dark, state preserved for resume */
 } led_mode_t;
 
 /* -----------------------------------------------------------------------
@@ -226,6 +222,11 @@ static int           g_current_view = VIEW_FRONT;
 static int           g_selected_zone = 0;        /* index into g_zones[] */
 
 static char          g_settings_path[MAX_PATH_LEN] = {0};
+static char          g_state_path[MAX_PATH_LEN] = {0};
+
+/* Tracks which animation is configured (index into g_animations[], or -1 for none).
+ * Valid in any mode — MODE_OFF remembers this so it can resume. */
+static int           g_anim_idx = -1;
 
 /* Device images */
 static SDL_Texture  *g_img_front_variants[FRONT_IMG_COUNT] = {NULL};
@@ -360,13 +361,12 @@ static void led_apply_color_only(int zone_idx) {
 
 /* Forward declarations */
 static void save_settings(void);
-static void settings_backup(void);
-static int  settings_restore_backup(void);
+static void save_state(void);
 static void anim_stop(void);
 static void anim_start(int anim_idx);
 static int  anim_is_running(void);
 static int  anim_get_running_index(void);
-static void anim_save_config(int anim_idx);
+static pid_t anim_read_pid(void);
 
 /* Sync brightness after a single zone change (handles shared hardware paths) */
 static void sync_brightness_after_change(int zone_idx) {
@@ -511,10 +511,9 @@ static int anim_is_running(void) {
 /* Get the index of the currently running animation, or -1 if none.
  * Reads /proc/<pid>/cmdline to match against known script names. */
 static int anim_get_running_index(void) {
-    if (!anim_is_running()) return -1;
-
     pid_t pid = anim_read_pid();
     if (pid <= 0) return -1;
+    if (kill(pid, 0) != 0) return -1;
 
     /* Read the command line of the running process */
     char proc_path[64];
@@ -579,16 +578,15 @@ static void anim_stop(void) {
     /* Clean up PID file if the script's trap didn't */
     unlink(ANIM_PID_FILE);
 
-    /* Re-enable effect system and restore real settings from backup */
+    /* Re-enable effect system and restore real colors from g_zone_state */
     ap_log("ANIM STOP: re-enabling effect system");
     sysfs_write_int("/sys/class/led_anim/effect_enable", 1);
-    if (!settings_restore_backup()) {
-        /* No backup — fall back to current g_zone_state */
-        ap_log("ANIM STOP: no backup found, using current zone state");
-    }
+    g_led_mode = MODE_STATIC;
+    g_anim_idx = -1;
     for (int i = 0; i < g_zone_count; i++)
         led_apply_zone(i);
     save_settings();
+    save_state();
 }
 
 /* Start an animation by index */
@@ -606,40 +604,18 @@ static void anim_start(int anim_idx) {
     snprintf(cmd, sizeof(cmd), "\"%s/scripts/%s\" > /dev/null 2>&1 &",
              pak_dir, g_animations[anim_idx].script);
 
-    /* Blank the hardware AND settings file before launching.
-     * Hardware: prevents blip during handoff to script.
-     * File: prevents NextUI from periodically re-applying real colors
-     * while the animation runs (causes intermittent blips).
-     * We zero colors and effects but keep real brightness so NextUI
-     * doesn't kill the animation by zeroing max_scale. */
+    /* Blank hardware to prevent blip during handoff to script */
     for (int i = 0; i < g_zone_count; i++) {
         led_write_color(g_zones[i].filename, 0, 0, 0);
         led_write_effect(g_zones[i].filename, 0);
     }
 
-    /* Back up real settings, then write black to the settings file */
-    settings_backup();
-    {
-        uint8_t saved_r[MAX_ZONES], saved_g[MAX_ZONES], saved_b[MAX_ZONES];
-        int saved_effect[MAX_ZONES];
-        for (int i = 0; i < g_zone_count; i++) {
-            saved_r[i] = g_zone_state[i].r;
-            saved_g[i] = g_zone_state[i].g;
-            saved_b[i] = g_zone_state[i].b;
-            saved_effect[i] = g_zone_state[i].effect;
-            g_zone_state[i].r = 0;
-            g_zone_state[i].g = 0;
-            g_zone_state[i].b = 0;
-            g_zone_state[i].effect = 0;
-        }
-        save_settings();
-        for (int i = 0; i < g_zone_count; i++) {
-            g_zone_state[i].r = saved_r[i];
-            g_zone_state[i].g = saved_g[i];
-            g_zone_state[i].b = saved_b[i];
-            g_zone_state[i].effect = saved_effect[i];
-        }
-    }
+    /* Write black to NextUI settings file (save_settings is mode-aware).
+     * g_zone_state keeps the real colors untouched. */
+    g_led_mode = MODE_ANIMATION;
+    g_anim_idx = anim_idx;
+    save_settings();
+    save_state();
 
     ap_log("ANIM START: launching %s: %s", g_animations[anim_idx].name, cmd);
     system(cmd);
@@ -679,70 +655,14 @@ static void anim_resume_after_editing(int anim_idx) {
 
     ap_log("ANIM: resuming %s after editing", g_animations[anim_idx].name);
     anim_start(anim_idx);
-    g_led_mode = MODE_ANIMATION;
 }
 
-/* Save the currently running animation to a config file for persistence */
-static void anim_save_config(int anim_idx) {
-    const char *pak_dir = getenv("LEDOH_PAK_DIR");
-    if (!pak_dir) return;
-
-    char path[MAX_PATH_LEN];
-    snprintf(path, sizeof(path), "%s/%s", pak_dir, ANIM_CONFIG_FILE);
-
-    FILE *f = fopen(path, "w");
-    if (!f) {
-        ap_log("ANIM CONFIG: failed to save to %s: %s", path, strerror(errno));
-        return;
-    }
-
-    if (anim_idx >= 0 && anim_idx < g_anim_count) {
-        fprintf(f, "%s\n", g_animations[anim_idx].script);
-        ap_log("ANIM CONFIG: saved %s to %s", g_animations[anim_idx].script, path);
-    } else {
-        fprintf(f, "off\n");
-        ap_log("ANIM CONFIG: saved 'off' to %s", path);
-    }
-
-    fclose(f);
-}
-
-/* Load the saved animation config. Returns animation index, or -1 for off/none. */
-static int anim_load_config(void) {
-    const char *pak_dir = getenv("LEDOH_PAK_DIR");
-    if (!pak_dir) return -1;
-
-    char path[MAX_PATH_LEN];
-    snprintf(path, sizeof(path), "%s/%s", pak_dir, ANIM_CONFIG_FILE);
-
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        ap_log("ANIM CONFIG: no config file at %s", path);
-        return -1;
-    }
-
-    char line[256] = {0};
-    if (!fgets(line, sizeof(line), f)) {
-        fclose(f);
-        return -1;
-    }
-    fclose(f);
-    trim_inplace(line);
-
-    if (strcmp(line, "off") == 0 || line[0] == '\0') {
-        ap_log("ANIM CONFIG: loaded 'off'");
-        return -1;
-    }
-
-    /* Match against known script filenames */
+/* Find animation index by script filename. Returns -1 if not found. */
+static int anim_find_by_script(const char *script) {
     for (int i = 0; i < g_anim_count; i++) {
-        if (strcmp(line, g_animations[i].script) == 0) {
-            ap_log("ANIM CONFIG: loaded %s (index %d)", g_animations[i].name, i);
+        if (strcmp(script, g_animations[i].script) == 0)
             return i;
-        }
     }
-
-    ap_log("ANIM CONFIG: unknown script '%s'", line);
     return -1;
 }
 
@@ -881,17 +801,78 @@ static void save_settings(void) {
         return;
     }
 
+    /* In off/animation mode, write black to NextUI so it doesn't
+     * re-apply real colors and cause blips. Keep real brightness
+     * so NextUI doesn't zero max_scale and kill animations. */
+    int blank = (g_led_mode == MODE_OFF || g_led_mode == MODE_ANIMATION);
+
+    for (int i = 0; i < g_zone_count; i++) {
+        const zone_def_t *zd = &g_zones[i];
+        zone_state_t *zs = &g_zone_state[i];
+        uint32_t color1 = blank ? 0 :
+            (((uint32_t)zs->r << 16) | ((uint32_t)zs->g << 8) | zs->b);
+        uint32_t color2 = ((uint32_t)zs->r2 << 16) | ((uint32_t)zs->g2 << 8) | zs->b2;
+        int effect = blank ? 0 : zs->effect;
+
+        /* MODE_OFF: also zero brightness so NextUI doesn't re-apply it.
+         * MODE_ANIMATION: keep real brightness so NextUI doesn't kill the animation. */
+        int brightness = (g_led_mode == MODE_OFF) ? 0 : zs->brightness;
+
+        ap_log("SETTINGS SAVED [%d/%s]: color1=0x%06X effect=%d brightness=%d%s",
+               i, zd->filename, color1, effect, brightness,
+               blank ? " (blanked)" : "");
+
+        fprintf(f, "[%s]\n", zd->filename);
+        fprintf(f, "effect=%d\n", effect);
+        fprintf(f, "color1=0x%06X\n", color1);
+        fprintf(f, "color2=0x%06X\n", color2);
+        fprintf(f, "speed=%d\n", zs->speed);
+        fprintf(f, "brightness=%d\n", brightness);
+        fprintf(f, "trigger=%d\n", zs->trigger);
+        fprintf(f, "filename=%s\n", zd->filename);
+        fprintf(f, "inbrightness=%d\n", zs->inbrightness);
+        fprintf(f, "\n");
+    }
+
+    fclose(f);
+    ap_log("SETTINGS: saved to %s", g_settings_path);
+}
+
+/* -----------------------------------------------------------------------
+ * State file: single source of truth for mode, animation, and real colors
+ * The NextUI settings file is a projection of this — black when off/animation.
+ * ----------------------------------------------------------------------- */
+
+static void save_state(void) {
+    if (g_state_path[0] == '\0') return;
+
+    char dir[MAX_PATH_LEN];
+    snprintf(dir, sizeof(dir), "%s", g_state_path);
+    char *slash = strrchr(dir, '/');
+    if (slash) { *slash = '\0'; mkdir(dir, 0755); }
+
+    FILE *f = fopen(g_state_path, "w");
+    if (!f) {
+        ap_log("STATE: failed to save to %s: %s", g_state_path, strerror(errno));
+        return;
+    }
+
+    const char *mode_str = "static";
+    if (g_led_mode == MODE_ANIMATION) mode_str = "animation";
+    else if (g_led_mode == MODE_OFF)  mode_str = "off";
+    fprintf(f, "mode=%s\n", mode_str);
+
+    if (g_anim_idx >= 0 && g_anim_idx < g_anim_count)
+        fprintf(f, "animation=%s\n", g_animations[g_anim_idx].script);
+    else
+        fprintf(f, "animation=\n");
+    fprintf(f, "\n");
+
     for (int i = 0; i < g_zone_count; i++) {
         const zone_def_t *zd = &g_zones[i];
         zone_state_t *zs = &g_zone_state[i];
         uint32_t color1 = ((uint32_t)zs->r << 16) | ((uint32_t)zs->g << 8) | zs->b;
-        /* color2 is preserved from the settings file — not overwritten with color1 */
         uint32_t color2 = ((uint32_t)zs->r2 << 16) | ((uint32_t)zs->g2 << 8) | zs->b2;
-
-        ap_log("SETTINGS SAVED [%d/%s]: r=%d g=%d b=%d r2=%d g2=%d b2=%d effect=%d brightness=%d speed=%d",
-               i, zd->filename, zs->r, zs->g, zs->b,
-               zs->r2, zs->g2, zs->b2,
-               zs->effect, zs->brightness, zs->speed);
 
         fprintf(f, "[%s]\n", zd->filename);
         fprintf(f, "effect=%d\n", zs->effect);
@@ -906,66 +887,100 @@ static void save_settings(void) {
     }
 
     fclose(f);
-    ap_log("SETTINGS: saved to %s", g_settings_path);
+    ap_log("STATE: saved mode=%s anim=%s to %s", mode_str,
+           (g_anim_idx >= 0) ? g_animations[g_anim_idx].script : "(none)",
+           g_state_path);
 }
 
-/* Back up the settings file before animation blanks it.
- * Saves a copy with the real colors so they can be restored later. */
-static void settings_backup(void) {
-    if (g_settings_path[0] == '\0') return;
+/* Load state file. Populates g_led_mode, g_anim_idx, and g_zone_state.
+ * Returns 1 if state file was found and loaded, 0 if not (caller should
+ * fall back to reading the NextUI settings file for first-run / upgrade). */
+static int load_state(void) {
+    if (g_state_path[0] == '\0') return 0;
 
-    char backup_path[MAX_PATH_LEN + 16];
-    snprintf(backup_path, sizeof(backup_path), "%s%s", g_settings_path, SETTINGS_BACKUP_SUFFIX);
-
-    /* Don't overwrite an existing backup — it has the real colors
-     * from before any animation started.  On reboot the settings file
-     * already has black, so backing it up again would lose the originals. */
-    if (access(backup_path, F_OK) == 0) {
-        ap_log("SETTINGS BACKUP: backup already exists, keeping it");
-        return;
+    FILE *f = fopen(g_state_path, "r");
+    if (!f) {
+        ap_log("STATE: no state file at %s", g_state_path);
+        return 0;
     }
 
-    FILE *src = fopen(g_settings_path, "r");
-    if (!src) return;
-    FILE *dst = fopen(backup_path, "w");
-    if (!dst) { fclose(src); return; }
+    set_defaults();
+    g_led_mode = MODE_STATIC;
+    g_anim_idx = -1;
 
-    char buf[512];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), src)) > 0)
-        fwrite(buf, 1, n, dst);
+    char line[MAX_LINE];
+    int current_zone = -1;
+    char anim_script[64] = {0};
 
-    fclose(src);
-    fclose(dst);
-    ap_log("SETTINGS BACKUP: saved to %s", backup_path);
-}
+    while (fgets(line, sizeof(line), f)) {
+        trim_inplace(line);
+        if (line[0] == '\0' || line[0] == '#') continue;
 
-/* Restore settings from backup (after animation stops or on startup recovery).
- * Copies backup over the main settings file, reloads into g_zone_state,
- * and deletes the backup. */
-static int settings_restore_backup(void) {
-    if (g_settings_path[0] == '\0') return 0;
+        if (line[0] == '[') {
+            char section[64] = {0};
+            if (sscanf(line, "[%63[^]]]", section) == 1)
+                current_zone = find_zone_by_section(section);
+            continue;
+        }
 
-    char backup_path[MAX_PATH_LEN + 16];
-    snprintf(backup_path, sizeof(backup_path), "%s%s", g_settings_path, SETTINGS_BACKUP_SUFFIX);
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = line;
+        char *val = eq + 1;
+        trim_inplace(key);
+        trim_inplace(val);
 
-    FILE *src = fopen(backup_path, "r");
-    if (!src) return 0;  /* no backup exists */
-    FILE *dst = fopen(g_settings_path, "w");
-    if (!dst) { fclose(src); return 0; }
+        if (current_zone < 0) {
+            if (strcmp(key, "mode") == 0) {
+                if (strcmp(val, "animation") == 0)
+                    g_led_mode = MODE_ANIMATION;
+                else if (strcmp(val, "off") == 0)
+                    g_led_mode = MODE_OFF;
+                else
+                    g_led_mode = MODE_STATIC;
+            } else if (strcmp(key, "animation") == 0) {
+                snprintf(anim_script, sizeof(anim_script), "%s", val);
+            }
+            continue;
+        }
 
-    char buf[512];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), src)) > 0)
-        fwrite(buf, 1, n, dst);
+        zone_state_t *zs = &g_zone_state[current_zone];
+        if (strcmp(key, "color1") == 0) {
+            parse_color(val, &zs->r, &zs->g, &zs->b);
+        } else if (strcmp(key, "color2") == 0) {
+            parse_color(val, &zs->r2, &zs->g2, &zs->b2);
+        } else if (strcmp(key, "effect") == 0) {
+            zs->effect = atoi(val);
+            if (zs->effect < EFFECT_MIN) zs->effect = 4;
+        } else if (strcmp(key, "speed") == 0) {
+            zs->speed = atoi(val);
+        } else if (strcmp(key, "brightness") == 0) {
+            zs->brightness = atoi(val);
+        } else if (strcmp(key, "trigger") == 0) {
+            zs->trigger = atoi(val);
+        } else if (strcmp(key, "inbrightness") == 0) {
+            zs->inbrightness = atoi(val);
+        }
+    }
 
-    fclose(src);
-    fclose(dst);
-    unlink(backup_path);
+    fclose(f);
 
-    /* Reload settings into g_zone_state */
-    load_settings();
-    ap_log("SETTINGS BACKUP: restored from %s", backup_path);
+    if (anim_script[0] != '\0')
+        g_anim_idx = anim_find_by_script(anim_script);
+
+    ap_log("STATE: loaded mode=%s anim_idx=%d from %s",
+           g_led_mode == MODE_OFF ? "off" :
+           g_led_mode == MODE_ANIMATION ? "animation" : "static",
+           g_anim_idx, g_state_path);
+
+    for (int i = 0; i < g_zone_count; i++) {
+        zone_state_t *zs = &g_zone_state[i];
+        ap_log("STATE LOADED [%d/%s]: r=%d g=%d b=%d effect=%d brightness=%d speed=%d",
+               i, g_zones[i].filename, zs->r, zs->g, zs->b,
+               zs->effect, zs->brightness, zs->speed);
+    }
+
     return 1;
 }
 
@@ -1262,15 +1277,6 @@ static void draw_led_overlay_brick(int zone_idx, int img_x, int img_y, float sca
         int ow = (int)(ov->w * scale);
         int oh = (int)(ov->h * scale);
 
-        if (ov->rounded) {
-            /* Draw rounded pill for FN buttons */
-            ap_color c = { zs->r, zs->g, zs->b, led_alpha };
-            ap_draw_pill(ox, oy, ow, oh, c);
-        } else {
-            draw_rect_alpha(ox, oy, ow, oh, zs->r, zs->g, zs->b, led_alpha);
-        }
-
-        /* Draw pill border BEHIND the fill */
         if (is_selected && ov->rounded) {
             uint8_t pulse_a = get_pulse_alpha();
             int t = border_thick;
@@ -1278,7 +1284,6 @@ static void draw_led_overlay_brick(int zone_idx, int img_x, int img_y, float sca
             ap_draw_pill(ox - t, oy - t, ow + t * 2, oh + t * 2, border_c);
         }
 
-        /* Draw the fill */
         if (ov->rounded) {
             ap_color c = { zs->r, zs->g, zs->b, led_alpha };
             ap_draw_pill(ox, oy, ow, oh, c);
@@ -1286,7 +1291,6 @@ static void draw_led_overlay_brick(int zone_idx, int img_x, int img_y, float sca
             draw_rect_alpha(ox, oy, ow, oh, zs->r, zs->g, zs->b, led_alpha);
         }
 
-        /* Rectangular border drawn AFTER fill (it's outside) */
         if (is_selected && !ov->rounded) {
             uint8_t pulse_a = get_pulse_alpha();
             draw_selection_border(ox, oy, ow, oh, pulse_a, border_thick);
@@ -1304,23 +1308,13 @@ static void draw_led_overlay_smartpro(int zone_idx, int img_x, int img_y, float 
 
     const char *fn = g_zones[zone_idx].filename;
 
-    if (strcmp(fn, "l") == 0) {
-        /* Left joystick ring */
-        int cx = img_x + (int)(SP_RING_L_CX * scale);
-        int cy = img_y + (int)(SP_RING_L_CY * scale);
+    if (strcmp(fn, "l") == 0 || strcmp(fn, "r") == 0) {
+        int rcx = (strcmp(fn, "l") == 0) ? SP_RING_L_CX : SP_RING_R_CX;
+        int rcy = (strcmp(fn, "l") == 0) ? SP_RING_L_CY : SP_RING_R_CY;
+        int cx = img_x + (int)(rcx * scale);
+        int cy = img_y + (int)(rcy * scale);
         int ir = (int)(SP_RING_L_IR * scale);
         int or_ = (int)(SP_RING_L_OR * scale);
-        draw_filled_ring(cx, cy, ir, or_, zs->r, zs->g, zs->b, led_alpha);
-        if (is_selected) {
-            uint8_t pulse_a = get_pulse_alpha();
-            draw_ring_outline(cx, cy, or_, border_thick, 0, 0, 0, pulse_a);
-        }
-    } else if (strcmp(fn, "r") == 0) {
-        /* Right joystick ring (mirrored) */
-        int cx = img_x + (int)(SP_RING_R_CX * scale);
-        int cy = img_y + (int)(SP_RING_R_CY * scale);
-        int ir = (int)(SP_RING_R_IR * scale);
-        int or_ = (int)(SP_RING_R_OR * scale);
         draw_filled_ring(cx, cy, ir, or_, zs->r, zs->g, zs->b, led_alpha);
         if (is_selected) {
             uint8_t pulse_a = get_pulse_alpha();
@@ -1690,6 +1684,15 @@ static void rgb_to_hsl(uint8_t r, uint8_t g, uint8_t b,
     *h /= 6.0f;
 }
 
+/* Map a vertical position within the color field to HSL lightness.
+ * Top = white (L=1.0), middle = fully saturated (L=0.5), bottom = black (L=0.0). */
+static float field_y_to_lightness(int y, int field_h) {
+    int mid = field_h / 2;
+    if (y <= mid)
+        return 1.0f - ((float)y / (float)mid) * 0.5f;
+    return 0.5f - ((float)(y - mid) / (float)(field_h - mid)) * 0.5f;
+}
+
 /* -----------------------------------------------------------------------
  * Color picker screen
  * ----------------------------------------------------------------------- */
@@ -1837,13 +1840,7 @@ static void show_color_picker(int zone_idx) {
 
             /* Convert cursor position to color */
             float h = (float)cursor_x / (float)(field_w - 1);
-            float l;
-            int mid = field_h / 2;
-            if (cursor_y <= mid) {
-                l = 1.0f - ((float)cursor_y / (float)mid) * 0.5f;
-            } else {
-                l = 0.5f - ((float)(cursor_y - mid) / (float)(field_h - mid)) * 0.5f;
-            }
+            float l = field_y_to_lightness(cursor_y, field_h);
             float s = 1.0f;
             hsl_to_rgb(h, s, l, &zs->r, &zs->g, &zs->b);
 
@@ -1864,13 +1861,7 @@ static void show_color_picker(int zone_idx) {
             if (SDL_LockTexture(field_tex, NULL, &pixels, &pitch) == 0) {
                 for (int fy = 0; fy < field_h; fy++) {
                     uint8_t *row = (uint8_t *)pixels + fy * pitch;
-                    int mid = field_h / 2;
-                    float l;
-                    if (fy <= mid) {
-                        l = 1.0f - ((float)fy / (float)mid) * 0.5f;
-                    } else {
-                        l = 0.5f - ((float)(fy - mid) / (float)(field_h - mid)) * 0.5f;
-                    }
+                    float l = field_y_to_lightness(fy, field_h);
                     for (int fx = 0; fx < field_w; fx++) {
                         float h = (float)fx / (float)(field_w - 1);
                         uint8_t pr, pg, pb;
@@ -2028,10 +2019,6 @@ static void show_animations_menu(void) {
         if (anim_is_running()) {
             ap_log("ANIM MENU: user selected Off, stopping animation");
             anim_stop();
-            anim_save_config(-1);
-            g_led_mode = MODE_STATIC;
-            for (int i = 0; i < g_zone_count; i++)
-                led_apply_zone(i);
             pakkit_message("Animation stopped", "OK");
         }
     } else {
@@ -2044,8 +2031,6 @@ static void show_animations_menu(void) {
         }
 
         anim_start(anim_idx);
-        anim_save_config(anim_idx);
-        g_led_mode = MODE_ANIMATION;
 
         char msg[128];
         snprintf(msg, sizeof(msg), "%s started!", g_animations[anim_idx].name);
@@ -2054,223 +2039,162 @@ static void show_animations_menu(void) {
 }
 
 /* -----------------------------------------------------------------------
+ * Helpers for menu actions
+ * ----------------------------------------------------------------------- */
+
+static void reset_zone(int zone_idx) {
+    zone_state_t *zs = &g_zone_state[zone_idx];
+    uint8_t saved_r2 = zs->r2, saved_g2 = zs->g2, saved_b2 = zs->b2;
+    int saved_trigger = zs->trigger;
+    int saved_inbrightness = zs->inbrightness;
+    *zs = (zone_state_t){
+        .r = 255, .g = 255, .b = 255,
+        .r2 = saved_r2, .g2 = saved_g2, .b2 = saved_b2,
+        .effect = 4, .speed = 1000, .brightness = 100,
+        .trigger = saved_trigger, .inbrightness = saved_inbrightness,
+    };
+}
+
+static void show_about(void) {
+    pakkit_info_pair info[] = {
+        { .key = "Version", .value = LEDOH_VERSION },
+        { .key = "Platform", .value = AP_PLATFORM_NAME },
+        { .key = "UI", .value = "PakKit" },
+        { .key = "License", .value = "MIT" },
+    };
+    const char *credits[] = {
+        "LED'oh! by Eric Reinsmidt",
+        "Built with Apostrophe",
+        "For NextUI by LoveRetro",
+    };
+    pakkit_detail_opts opts = {
+        .title = "LED'oh!",
+        .subtitle = "LED color controller for NextUI",
+        .info = info, .info_count = 4,
+        .credits = credits, .credit_count = 3,
+    };
+    pakkit_detail_screen(&opts);
+}
+
+/* -----------------------------------------------------------------------
+ * LED toggle
+ * ----------------------------------------------------------------------- */
+
+static void leds_off(void) {
+    ap_log("TOGGLE: turning LEDs off");
+
+    /* Stop animation if running */
+    if (g_led_mode == MODE_ANIMATION && anim_is_running()) {
+        pid_t pid = anim_read_pid();
+        if (pid > 0) {
+            kill(pid, SIGTERM);
+            for (int i = 0; i < 10; i++) {
+                usleep(100000);
+                if (kill(pid, 0) != 0) break;
+            }
+            if (kill(pid, 0) == 0) {
+                kill(pid, SIGKILL);
+                usleep(200000);
+            }
+            unlink(ANIM_PID_FILE);
+        }
+    }
+
+    /* Blank hardware — zero brightness, color, and effect */
+    for (int i = 0; i < g_zone_count; i++) {
+        led_write_brightness(g_zones[i].filename, 0);
+        led_write_color(g_zones[i].filename, 0, 0, 0);
+        led_write_effect(g_zones[i].filename, 0);
+    }
+
+    g_led_mode = MODE_OFF;
+    save_settings();
+    save_state();
+    ap_log("TOGGLE: LEDs off complete");
+}
+
+static void leds_on(void) {
+    ap_log("TOGGLE: turning LEDs on (anim_idx=%d)", g_anim_idx);
+
+    /* Re-enable effect system first */
+    sysfs_write_int("/sys/class/led_anim/effect_enable", 1);
+
+    if (g_is_brick && g_anim_idx >= 0 && g_anim_idx < g_anim_count) {
+        /* Restore brightness before animation takes over */
+        for (int i = 0; i < g_zone_count; i++)
+            led_write_brightness(g_zones[i].filename, g_zone_state[i].brightness);
+        anim_start(g_anim_idx);
+    } else {
+        g_led_mode = MODE_STATIC;
+        g_anim_idx = -1;
+        for (int i = 0; i < g_zone_count; i++)
+            led_apply_zone(i);
+        save_settings();
+        save_state();
+    }
+    ap_log("TOGGLE: LEDs on complete");
+}
+
+/* -----------------------------------------------------------------------
  * Menu screen (Y button)
  * ----------------------------------------------------------------------- */
 
 static void show_menu(void) {
+    int has_anims = g_is_brick && g_anim_count > 0;
+    int anim_active = has_anims && (g_led_mode == MODE_ANIMATION);
     char zone_settings_label[128];
     snprintf(zone_settings_label, sizeof(zone_settings_label), "%s Settings", g_zones[g_selected_zone].name);
 
-    /* Build menu items — animations only on Brick when scripts are available.
-     * When an animation is active, hide zone settings/reset (they're irrelevant). */
-    if (g_is_brick && g_anim_count > 0) {
-        int anim_active = (g_led_mode == MODE_ANIMATION);
-        char anim_label[128];
-        if (anim_active) {
-            snprintf(anim_label, sizeof(anim_label), "Animations  \xe2\x9c\x93");
-        } else {
-            snprintf(anim_label, sizeof(anim_label), "Animations");
+    char anim_label[128];
+    if (has_anims) {
+        snprintf(anim_label, sizeof(anim_label), "Animations%s",
+                 anim_active ? "  \xe2\x9c\x93" : "");
+    }
+
+    /* Build menu dynamically based on device and animation state */
+    pakkit_menu_item items[8];
+    int n = 0;
+
+    if (!anim_active)
+        items[n++] = (pakkit_menu_item){ .label = zone_settings_label };
+    if (has_anims)
+        items[n++] = (pakkit_menu_item){ .label = anim_label };
+    if (!anim_active) {
+        items[n++] = (pakkit_menu_item){ .label = "Reset This Zone" };
+        items[n++] = (pakkit_menu_item){ .label = "Reset All Zones" };
+    }
+    items[n++] = (pakkit_menu_item){ .label = "About" };
+
+    pakkit_menu_result result;
+    int rc = pakkit_menu("Menu", items, n, &result);
+    if (rc != AP_OK) return;
+
+    const char *picked = items[result.selected_index].label;
+
+    if (picked == zone_settings_label) {
+        show_zone_settings(g_selected_zone);
+    } else if (picked == anim_label) {
+        show_animations_menu();
+    } else if (strcmp(picked, "Reset This Zone") == 0) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Reset %s to white?", g_zones[g_selected_zone].name);
+        if (pakkit_confirm(msg, "Reset", "Cancel")) {
+            ap_log("MENU: resetting zone %d/%s to defaults",
+                   g_selected_zone, g_zones[g_selected_zone].filename);
+            reset_zone(g_selected_zone);
+            sync_brightness_after_change(g_selected_zone);
+            led_apply_zone(g_selected_zone);
         }
-
-        if (anim_active) {
-            pakkit_menu_item items[] = {
-                { .label = anim_label },
-                { .label = "About" },
-            };
-            pakkit_menu_result result;
-            int rc = pakkit_menu("Menu", items, 2, &result);
-            if (rc != AP_OK) return;
-
-            switch (result.selected_index) {
-                case 0: show_animations_menu(); break;
-                case 1: {
-                    pakkit_info_pair info[] = {
-                        { .key = "Version", .value = LEDOH_VERSION },
-                        { .key = "Platform", .value = AP_PLATFORM_NAME },
-                        { .key = "UI", .value = "PakKit" },
-                        { .key = "License", .value = "MIT" },
-                    };
-                    const char *credits[] = {
-                        "LED'oh! by Eric Reinsmidt",
-                        "Built with Apostrophe",
-                        "For NextUI by LoveRetro",
-                    };
-                    pakkit_detail_opts opts = {
-                        .title = "LED'oh!",
-                        .subtitle = "LED color controller for NextUI",
-                        .info = info, .info_count = 4,
-                        .credits = credits, .credit_count = 3,
-                    };
-                    pakkit_detail_screen(&opts);
-                    break;
-                }
-            }
-        } else {
-            pakkit_menu_item items[] = {
-                { .label = zone_settings_label },
-                { .label = anim_label },
-                { .label = "Reset This Zone" },
-                { .label = "Reset All Zones" },
-                { .label = "About" },
-            };
-            pakkit_menu_result result;
-            int rc = pakkit_menu("Menu", items, 5, &result);
-            if (rc != AP_OK) return;
-
-            switch (result.selected_index) {
-                case 0: {
-                    show_zone_settings(g_selected_zone);
-                    break;
-                }
-                case 1: {
-                    show_animations_menu();
-                    break;
-                }
-                case 2: {
-                    char msg[128];
-                    snprintf(msg, sizeof(msg), "Reset %s to white?", g_zones[g_selected_zone].name);
-                    if (pakkit_confirm(msg, "Reset", "Cancel")) {
-                        ap_log("MENU: resetting zone %d/%s to defaults (preserving color2/trigger/inbrightness)",
-                               g_selected_zone, g_zones[g_selected_zone].filename);
-                        zone_state_t *zs = &g_zone_state[g_selected_zone];
-                        uint8_t saved_r2 = zs->r2, saved_g2 = zs->g2, saved_b2 = zs->b2;
-                        int saved_trigger = zs->trigger;
-                        int saved_inbrightness = zs->inbrightness;
-                        *zs = (zone_state_t){
-                            .r = 255, .g = 255, .b = 255,
-                            .r2 = saved_r2, .g2 = saved_g2, .b2 = saved_b2,
-                            .effect = 4, .speed = 1000, .brightness = 100,
-                            .trigger = saved_trigger, .inbrightness = saved_inbrightness,
-                        };
-                        sync_brightness_after_change(g_selected_zone);
-                        led_apply_zone(g_selected_zone);
-                    }
-                    break;
-                }
-                case 3: {
-                    if (pakkit_confirm("Reset all zones to white?", "Reset All", "Cancel")) {
-                        ap_log("MENU: resetting all zones to defaults (preserving color2/trigger/inbrightness)");
-                        for (int i = 0; i < g_zone_count; i++) {
-                            zone_state_t *zs = &g_zone_state[i];
-                            uint8_t saved_r2 = zs->r2, saved_g2 = zs->g2, saved_b2 = zs->b2;
-                            int saved_trigger = zs->trigger;
-                            int saved_inbrightness = zs->inbrightness;
-                            *zs = (zone_state_t){
-                                .r = 255, .g = 255, .b = 255,
-                                .r2 = saved_r2, .g2 = saved_g2, .b2 = saved_b2,
-                                .effect = 4, .speed = 1000, .brightness = 100,
-                                .trigger = saved_trigger, .inbrightness = saved_inbrightness,
-                            };
-                        }
-                        for (int i = 0; i < g_zone_count; i++)
-                            led_apply_zone(i);
-                    }
-                    break;
-                }
-                case 4: {
-                    pakkit_info_pair info[] = {
-                        { .key = "Version", .value = LEDOH_VERSION },
-                        { .key = "Platform", .value = AP_PLATFORM_NAME },
-                        { .key = "UI", .value = "PakKit" },
-                        { .key = "License", .value = "MIT" },
-                    };
-                    const char *credits[] = {
-                        "LED'oh! by Eric Reinsmidt",
-                        "Built with Apostrophe",
-                        "For NextUI by LoveRetro",
-                    };
-                    pakkit_detail_opts opts = {
-                        .title = "LED'oh!",
-                        .subtitle = "LED color controller for NextUI",
-                        .info = info, .info_count = 4,
-                        .credits = credits, .credit_count = 3,
-                    };
-                    pakkit_detail_screen(&opts);
-                    break;
-                }
-            }
+    } else if (strcmp(picked, "Reset All Zones") == 0) {
+        if (pakkit_confirm("Reset all zones to white?", "Reset All", "Cancel")) {
+            ap_log("MENU: resetting all zones to defaults");
+            for (int i = 0; i < g_zone_count; i++)
+                reset_zone(i);
+            for (int i = 0; i < g_zone_count; i++)
+                led_apply_zone(i);
         }
-    } else {
-        /* Smart Pro — no animations menu */
-        pakkit_menu_item items[] = {
-            { .label = zone_settings_label },
-            { .label = "Reset This Zone" },
-            { .label = "Reset All Zones" },
-            { .label = "About" },
-        };
-        pakkit_menu_result result;
-        int rc = pakkit_menu("Menu", items, 4, &result);
-        if (rc != AP_OK) return;
-
-        switch (result.selected_index) {
-            case 0: {
-                show_zone_settings(g_selected_zone);
-                break;
-            }
-            case 1: {
-                /* Reset selected zone */
-                char msg[128];
-                snprintf(msg, sizeof(msg), "Reset %s to white?", g_zones[g_selected_zone].name);
-                if (pakkit_confirm(msg, "Reset", "Cancel")) {
-                    ap_log("MENU: resetting zone %d/%s to defaults",
-                           g_selected_zone, g_zones[g_selected_zone].filename);
-                    zone_state_t *zs = &g_zone_state[g_selected_zone];
-                    uint8_t saved_r2 = zs->r2, saved_g2 = zs->g2, saved_b2 = zs->b2;
-                    int saved_trigger = zs->trigger;
-                    int saved_inbrightness = zs->inbrightness;
-                    *zs = (zone_state_t){
-                        .r = 255, .g = 255, .b = 255,
-                        .r2 = saved_r2, .g2 = saved_g2, .b2 = saved_b2,
-                        .effect = 4, .speed = 1000, .brightness = 100,
-                        .trigger = saved_trigger, .inbrightness = saved_inbrightness,
-                    };
-                    sync_brightness_after_change(g_selected_zone);
-                    led_apply_zone(g_selected_zone);
-                }
-                break;
-            }
-            case 2: {
-                if (pakkit_confirm("Reset all zones to white?", "Reset All", "Cancel")) {
-                    ap_log("MENU: resetting all zones to defaults");
-                    for (int i = 0; i < g_zone_count; i++) {
-                        zone_state_t *zs = &g_zone_state[i];
-                        uint8_t saved_r2 = zs->r2, saved_g2 = zs->g2, saved_b2 = zs->b2;
-                        int saved_trigger = zs->trigger;
-                        int saved_inbrightness = zs->inbrightness;
-                        *zs = (zone_state_t){
-                            .r = 255, .g = 255, .b = 255,
-                            .r2 = saved_r2, .g2 = saved_g2, .b2 = saved_b2,
-                            .effect = 4, .speed = 1000, .brightness = 100,
-                            .trigger = saved_trigger, .inbrightness = saved_inbrightness,
-                        };
-                    }
-                    for (int i = 0; i < g_zone_count; i++)
-                        led_apply_zone(i);
-                }
-                break;
-            }
-            case 3: {
-                pakkit_info_pair info[] = {
-                    { .key = "Version", .value = LEDOH_VERSION },
-                    { .key = "Platform", .value = AP_PLATFORM_NAME },
-                    { .key = "UI", .value = "PakKit" },
-                    { .key = "License", .value = "MIT" },
-                };
-                const char *credits[] = {
-                    "LED'oh! by Eric Reinsmidt",
-                    "Built with Apostrophe",
-                    "For NextUI by LoveRetro",
-                };
-                pakkit_detail_opts opts = {
-                    .title = "LED'oh!",
-                    .subtitle = "LED color controller for NextUI",
-                    .info = info, .info_count = 4,
-                    .credits = credits, .credit_count = 3,
-                };
-                pakkit_detail_screen(&opts);
-                break;
-            }
-        }
+    } else if (strcmp(picked, "About") == 0) {
+        show_about();
     }
 }
 
@@ -2289,23 +2213,19 @@ static void show_device_view(void) {
                 switch (ev.button) {
                     case AP_BTN_B:
                         if (!ev.repeated) {
-                            /* In animation mode, don't save — the settings file
-                             * intentionally has black colors to prevent blips.
-                             * The real colors are safe in the backup file. */
-                            if (g_led_mode != MODE_ANIMATION) {
-                                ap_log("QUIT: saving settings");
-                                save_settings();
-                            }
+                            ap_log("QUIT: saving state and settings");
+                            save_state();
+                            save_settings();
                             running = 0;
                         }
                         break;
                     case AP_BTN_A:
-                        if (!ev.repeated) {
+                        if (!ev.repeated && g_led_mode != MODE_OFF) {
                             show_color_picker(g_selected_zone);
                         }
                         break;
                     case AP_BTN_LEFT:
-                        if (!ev.repeated) {
+                        if (!ev.repeated && g_led_mode != MODE_OFF) {
                             if (g_is_brick) {
                                 /* Brick: L/R only on front view */
                                 if (g_current_view == VIEW_FRONT) {
@@ -2325,7 +2245,7 @@ static void show_device_view(void) {
                         }
                         break;
                     case AP_BTN_RIGHT:
-                        if (!ev.repeated) {
+                        if (!ev.repeated && g_led_mode != MODE_OFF) {
                             if (g_is_brick) {
                                 if (g_current_view == VIEW_FRONT) {
                                     int last = -1;
@@ -2347,7 +2267,7 @@ static void show_device_view(void) {
                         }
                         break;
                     case AP_BTN_UP:
-                        if (!ev.repeated && g_is_brick && g_current_view == VIEW_BACK) {
+                        if (!ev.repeated && g_led_mode != MODE_OFF && g_is_brick && g_current_view == VIEW_BACK) {
                             int first = first_zone_in_view(VIEW_BACK);
                             if (g_selected_zone != first) {
                                 g_selected_zone = first;
@@ -2356,7 +2276,7 @@ static void show_device_view(void) {
                         }
                         break;
                     case AP_BTN_DOWN:
-                        if (!ev.repeated && g_is_brick && g_current_view == VIEW_BACK) {
+                        if (!ev.repeated && g_led_mode != MODE_OFF && g_is_brick && g_current_view == VIEW_BACK) {
                             int last = -1;
                             for (int i = g_zone_count - 1; i >= 0; i--) {
                                 if (g_zones[i].view == VIEW_BACK) { last = i; break; }
@@ -2369,7 +2289,7 @@ static void show_device_view(void) {
                         break;
                     case AP_BTN_L1:
                     case AP_BTN_R1:
-                        if (!ev.repeated) {
+                        if (!ev.repeated && g_led_mode != MODE_OFF) {
                             int target_view = (g_current_view == VIEW_FRONT) ? VIEW_BACK : VIEW_FRONT;
                             /* Only flip if the target view has zones */
                             if (has_zones_in_view(target_view)) {
@@ -2383,15 +2303,19 @@ static void show_device_view(void) {
                         }
                         break;
                     case AP_BTN_X:
-                        /* X is unused — save happens on quit */
                         break;
                     case AP_BTN_Y:
-                        if (!ev.repeated) {
+                        if (!ev.repeated && g_led_mode != MODE_OFF) {
                             show_menu();
                         }
                         break;
                     case AP_BTN_MENU:
-                        /* Menu/Select button unused */
+                        if (!ev.repeated) {
+                            if (g_led_mode == MODE_OFF)
+                                leds_on();
+                            else
+                                leds_off();
+                        }
                         break;
                     default:
                         break;
@@ -2437,34 +2361,32 @@ static void show_device_view(void) {
         }
 
         /* Hints — device-specific layout */
-        if (g_is_brick) {
-            if (g_current_view == VIEW_FRONT) {
-                pakkit_hint hints[] = {
-                    { .button = "B", .label = "Quit" },
-                    { .button = "L/R", .label = "Select" },
-                    { .button = "L1", .label = "Flip" },
-                    { .button = "Y", .label = "Menu" },
-                    { .button = "A", .label = "Edit" },
-                };
-                pakkit_draw_hints(hints, 5);
-            } else {
-                pakkit_hint hints[] = {
-                    { .button = "B", .label = "Quit" },
-                    { .button = "U/D", .label = "Select" },
-                    { .button = "L1", .label = "Flip" },
-                    { .button = "Y", .label = "Menu" },
-                    { .button = "A", .label = "Edit" },
-                };
-                pakkit_draw_hints(hints, 5);
-            }
+        if (g_led_mode == MODE_OFF) {
+            pakkit_hint hints[] = {
+                { .button = "\xe2\x88\xb4 ON", .label = "" },
+                { .button = "B", .label = "Quit" },
+            };
+            pakkit_draw_hints(hints, 2);
+        } else if (g_is_brick) {
+            const char *nav = (g_current_view == VIEW_FRONT) ? "L/R" : "U/D";
+            pakkit_hint hints[] = {
+                { .button = "\xe2\x88\xb4 OFF", .label = "" },
+                { .button = "B", .label = "Quit" },
+                { .button = nav, .label = "Select" },
+                { .button = "L1", .label = "Flip" },
+                { .button = "Y", .label = "Menu" },
+                { .button = "A", .label = "Edit" },
+            };
+            pakkit_draw_hints(hints, 6);
         } else {
             pakkit_hint hints[] = {
+                { .button = "\xe2\x88\xb4 OFF", .label = "" },
                 { .button = "B", .label = "Quit" },
                 { .button = "L/R", .label = "Select" },
                 { .button = "Y", .label = "Menu" },
                 { .button = "A", .label = "Edit" },
             };
-            pakkit_draw_hints(hints, 4);
+            pakkit_draw_hints(hints, 5);
         }
 
         ap_present();
@@ -2522,6 +2444,8 @@ int main(int argc, char *argv[]) {
         g_dev_img_h = BRICK_IMG_H;
         snprintf(g_settings_path, sizeof(g_settings_path),
                  "/mnt/SDCARD/.userdata/shared/ledsettings_brick.txt");
+        snprintf(g_state_path, sizeof(g_state_path),
+                 "/mnt/SDCARD/.userdata/shared/ledoh_state_brick.txt");
     } else {
         g_is_brick = 0;
         g_zones = g_smartpro_zones;
@@ -2530,9 +2454,12 @@ int main(int argc, char *argv[]) {
         g_dev_img_h = SP_IMG_H;
         snprintf(g_settings_path, sizeof(g_settings_path),
                  "/mnt/SDCARD/.userdata/shared/ledsettings.txt");
+        snprintf(g_state_path, sizeof(g_state_path),
+                 "/mnt/SDCARD/.userdata/shared/ledoh_state.txt");
     }
     ap_log("STARTUP: is_brick = %d, zone_count = %d", g_is_brick, g_zone_count);
     ap_log("STARTUP: settings path = %s", g_settings_path);
+    ap_log("STARTUP: state path = %s", g_state_path);
 
     /* Discover animation scripts (Brick only) */
     if (g_is_brick)
@@ -2541,50 +2468,61 @@ int main(int argc, char *argv[]) {
     /* Load device images */
     load_device_images();
 
-    /* Load settings */
-    load_settings();
-
-    /* Check for persisted animation config — auto-launch if configured and not already running */
-    if (g_is_brick && !anim_is_running()) {
-        int saved_anim = anim_load_config();
-        if (saved_anim >= 0) {
-            ap_log("STARTUP: auto-launching saved animation: %s", g_animations[saved_anim].name);
-            anim_start(saved_anim);
-            g_led_mode = MODE_ANIMATION;
-        } else {
-            /* No animation to launch — if a backup exists, the previous animation
-             * died while the app was closed.  Restore the real settings. */
-            if (settings_restore_backup())
-                ap_log("STARTUP: recovered real settings from animation backup");
-        }
-    } else if (g_is_brick && anim_is_running()) {
-        g_led_mode = MODE_ANIMATION;
+    /* Load state (single source of truth).
+     * Falls back to NextUI settings file on first run / upgrade. */
+    if (!load_state()) {
+        ap_log("STARTUP: no state file, falling back to NextUI settings");
+        load_settings();
     }
 
-    /* Apply current settings to hardware (skip if animation daemon owns the LEDs) */
-    if (g_led_mode == MODE_ANIMATION) {
-        ap_log("STARTUP: animation running, skipping hardware apply");
-    } else {
-        ap_log("STARTUP: applying loaded settings to hardware (%d zones)", g_zone_count);
-        for (int i = 0; i < g_zone_count; i++)
-            led_apply_zone(i);
-        ap_log("STARTUP: hardware apply complete");
+    /* Act on the loaded mode */
+    switch (g_led_mode) {
+        case MODE_ANIMATION:
+            if (g_is_brick && g_anim_idx >= 0) {
+                if (!anim_is_running()) {
+                    ap_log("STARTUP: auto-launching saved animation: %s",
+                           g_animations[g_anim_idx].name);
+                    anim_start(g_anim_idx);
+                } else {
+                    ap_log("STARTUP: animation already running");
+                }
+            } else {
+                ap_log("STARTUP: animation mode but no valid animation, switching to static");
+                g_led_mode = MODE_STATIC;
+                g_anim_idx = -1;
+                for (int i = 0; i < g_zone_count; i++)
+                    led_apply_zone(i);
+            }
+            break;
+        case MODE_OFF:
+            ap_log("STARTUP: LEDs off, applying black to hardware");
+            for (int i = 0; i < g_zone_count; i++) {
+                led_write_brightness(g_zones[i].filename, 0);
+                led_write_color(g_zones[i].filename, 0, 0, 0);
+                led_write_effect(g_zones[i].filename, 0);
+            }
+            break;
+        case MODE_STATIC:
+            ap_log("STARTUP: applying loaded settings to hardware (%d zones)", g_zone_count);
+            for (int i = 0; i < g_zone_count; i++)
+                led_apply_zone(i);
+            ap_log("STARTUP: hardware apply complete");
+            break;
     }
 
     /* Main screen */
     show_device_view();
 
-    /* On exit: write zone state to sysfs so NextUI picks up consistent state.
-     * For animation mode: do NOT write to sysfs — the animation script owns
-     * the LED hardware and our writes would interfere with its frame cycle.
-     * The settings file already has black colors + real brightness, which
-     * NextUI will apply from the file if needed. */
-    if (g_led_mode == MODE_ANIMATION) {
-        ap_log("EXIT: animation running, skipping sysfs writes to avoid interference");
-    } else {
+    /* On exit: apply zone state to hardware for NextUI handoff.
+     * Skip if animation/off — animation script owns the hardware,
+     * and off mode should stay dark. */
+    if (g_led_mode == MODE_STATIC) {
         ap_log("EXIT: applying zone state to hardware");
         for (int i = 0; i < g_zone_count; i++)
             led_apply_zone(i);
+    } else {
+        ap_log("EXIT: mode=%s, skipping sysfs writes",
+               g_led_mode == MODE_OFF ? "off" : "animation");
     }
 
     /* Cleanup */

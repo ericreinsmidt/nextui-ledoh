@@ -80,15 +80,15 @@ bit_color() {
 
 count=0
 while true; do
-    # LED 1 = bit 7 (MSB, left), LED 8 = bit 0 (LSB, right)
-    L1=$(bit_color $count 7)
-    L2=$(bit_color $count 6)
-    L3=$(bit_color $count 5)
-    L4=$(bit_color $count 4)
-    L5=$(bit_color $count 3)
-    L6=$(bit_color $count 2)
-    L7=$(bit_color $count 1)
-    L8=$(bit_color $count 0)
+    # LED 1 = bit 0 (LSB, left), LED 8 = bit 7 (MSB, right)
+    L1=$(bit_color $count 0)
+    L2=$(bit_color $count 1)
+    L3=$(bit_color $count 2)
+    L4=$(bit_color $count 3)
+    L5=$(bit_color $count 4)
+    L6=$(bit_color $count 5)
+    L7=$(bit_color $count 6)
+    L8=$(bit_color $count 7)
 
     write_frame "$L1 $L2 $L3 $L4 $L5 $L6 $L7 $L8 000000 000000 $DB $DB $DB $DB"
 

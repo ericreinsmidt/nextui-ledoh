@@ -1,5 +1,5 @@
 #!/bin/sh
-# NAME: Morse (NEXTUI)
+# NAME: Morse
 # Morse Code — NEXTUI — TrimUI Brick per-LED animation
 # Flashes "NEXTUI" in morse code using NextUI brand color (deeper magenta)
 # N(-.) E(.) X(-..-) T(-) U(..-) I(..)
