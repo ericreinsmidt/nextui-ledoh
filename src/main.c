@@ -1803,31 +1803,41 @@ static void show_color_picker(int zone_idx) {
         /* Check d-pad held state via SDL joystick for smooth diagonal movement */
         int dx = 0, dy = 0;
 
+        /* L1/R1 held = fast move */
+        int fast = 0;
+        if (joy) {
+            int nb = SDL_JoystickNumButtons(joy);
+            if ((nb > 4 && SDL_JoystickGetButton(joy, 4)) ||
+                (nb > 5 && SDL_JoystickGetButton(joy, 5)))
+                fast = 1;
+        }
+        int speed = fast ? cursor_speed * 4 : cursor_speed;
+
         if (joy) {
             /* D-pad via hat */
             if (SDL_JoystickNumHats(joy) > 0) {
                 Uint8 hat = SDL_JoystickGetHat(joy, 0);
-                if (hat & SDL_HAT_LEFT)  dx -= cursor_speed;
-                if (hat & SDL_HAT_RIGHT) dx += cursor_speed;
-                if (hat & SDL_HAT_UP)    dy -= cursor_speed;
-                if (hat & SDL_HAT_DOWN)  dy += cursor_speed;
+                if (hat & SDL_HAT_LEFT)  dx -= speed;
+                if (hat & SDL_HAT_RIGHT) dx += speed;
+                if (hat & SDL_HAT_UP)    dy -= speed;
+                if (hat & SDL_HAT_DOWN)  dy += speed;
             }
             /* Also check analog stick with deadzone */
             Sint16 ax = SDL_JoystickGetAxis(joy, 0);
             Sint16 ay = SDL_JoystickGetAxis(joy, 1);
-            if (ax < -8000) dx -= cursor_speed;
-            if (ax >  8000) dx += cursor_speed;
-            if (ay < -8000) dy -= cursor_speed;
-            if (ay >  8000) dy += cursor_speed;
+            if (ax < -8000) dx -= speed;
+            if (ax >  8000) dx += speed;
+            if (ay < -8000) dy -= speed;
+            if (ay >  8000) dy += speed;
         }
 
         /* Keyboard fallback for dev mode */
         {
             const Uint8 *keys = SDL_GetKeyboardState(NULL);
-            if (keys[SDL_SCANCODE_LEFT])  dx -= cursor_speed;
-            if (keys[SDL_SCANCODE_RIGHT]) dx += cursor_speed;
-            if (keys[SDL_SCANCODE_UP])    dy -= cursor_speed;
-            if (keys[SDL_SCANCODE_DOWN])  dy += cursor_speed;
+            if (keys[SDL_SCANCODE_LEFT])  dx -= speed;
+            if (keys[SDL_SCANCODE_RIGHT]) dx += speed;
+            if (keys[SDL_SCANCODE_UP])    dy -= speed;
+            if (keys[SDL_SCANCODE_DOWN])  dy += speed;
         }
 
         if (dx != 0 || dy != 0) {
@@ -1936,10 +1946,11 @@ static void show_color_picker(int zone_idx) {
         /* Hints */
         pakkit_hint hints[] = {
             { .button = "B", .label = "Cancel" },
-            { .button = "D-pad", .label = "Pick" },
+            { .button = "D-pad", .label = "Move" },
+            { .button = "+L1/R1", .label = "Fast" },
             { .button = "A", .label = "Confirm" },
         };
-        pakkit_draw_hints(hints, 3);
+        pakkit_draw_hints(hints, 4);
 
         ap_present();
     }
