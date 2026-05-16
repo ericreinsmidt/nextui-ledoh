@@ -19,7 +19,7 @@ A graphical LED color controller for TrimUI Brick, Brick Hammer, and Smart Pro r
 - **Per-zone settings** — Brightness, effect type, and animation speed for each LED zone
 - **Real-time feedback** — Physical LEDs update instantly as you pick colors and adjust settings
 - **LEDs Off/On toggle** — Turn all LEDs off with a single button press; toggle back on to resume your previous state (static colors or running animation)
-- **Per-LED animations** — 11 animated LED patterns using per-LED frame control (Brick only)
+- **Per-LED animations** — 18 animated LED patterns using per-LED frame control (11 Brick, 7 Smart Pro)
 - **Persistent animations** — Animations survive app exit and device reboots
 - **Multi-device support** — Automatically detects Brick, Brick Hammer, or Smart Pro and adapts the UI
 - **Random front images** — Device view randomly picks from available front image variants on each view flip (app start for Smart Pro)
@@ -76,6 +76,7 @@ A graphical LED color controller for TrimUI Brick, Brick Hammer, and Smart Pro r
 | Button | Action |
 |--------|--------|
 | D-pad (8-direction) | Move cursor to pick color |
+| L1/R1 + D-pad | Fast cursor movement |
 | A | Confirm color |
 | B | Cancel (restore original color) |
 
@@ -89,15 +90,15 @@ A graphical LED color controller for TrimUI Brick, Brick Hammer, and Smart Pro r
 | A | Confirm |
 | B | Cancel (restore original values) |
 
-## Animations (Brick Only)
+## Animations
 
-Per-LED animation patterns that drive the Brick's 14 individually addressable LEDs via the `frame_hex` framebuffer. Animations run as background daemons that persist after the app exits and automatically restart on reboot.
+Per-LED animation patterns that drive individually addressable LEDs via the `frame_hex` framebuffer. The app automatically discovers and shows only the animations that match your device. Animations run as background daemons that persist after the app exits and automatically restart on reboot.
 
 Select animations from **Y → Menu → Animations**. While an animation is running, editing zone colors will pause the animation and resume it when you're done.
 
-Animations are discovered dynamically from the `scripts/` folder inside the pak directory. You can add your own — see [Creating Custom Animations](#creating-custom-animations) below.
+Animations are discovered dynamically from the `scripts/` folder inside the pak directory. Each script declares its target platform via a `# PLATFORM:` header. You can add your own — see [Creating Custom Animations](#creating-custom-animations) below.
 
-### Included Animations
+### Brick Animations (14 LEDs)
 
 | Animation | Description |
 |-----------|-------------|
@@ -113,6 +114,18 @@ Animations are discovered dynamically from the `scripts/` folder inside the pak 
 | Police | Red and blue alternating flash |
 | Pride | Rainbow flag color chase |
 
+### Smart Pro Animations (23 LEDs)
+
+| Animation | Description |
+|-----------|-------------|
+| Breathe | All LEDs pulse warm orange together |
+| Fill | Rings fill up from bottom, then drain back down |
+| Helix | Two colored dots chase each other around each ring |
+| Pulse | Alternating ring pulses — left brightens, then right |
+| Radar | Bright head with fading tail sweeping each ring |
+| Rainbow | 8-color rainbow slowly rotating around rings |
+| Spin | Counter-rotating dots on left and right rings |
+
 ### Creating Custom Animations
 
 Drop any `.sh` file into the `scripts/` folder inside the LED'oh! pak directory and it will automatically appear in the Animations menu. No recompilation needed.
@@ -122,24 +135,35 @@ Drop any `.sh` file into the `scripts/` folder inside the LED'oh! pak directory 
 **Requirements:**
 
 1. The script must be a POSIX shell script (starts with `#!/bin/sh`)
-2. Add a `# NAME: Your Animation Name` line in the first 5 lines to set the display name (otherwise the filename is used)
-3. The script must write all **14 LED positions** in every frame to avoid stale colors bleeding through
-4. Use PID file management so the app can detect and stop your animation
+2. Add a `# NAME: Your Animation Name` line in the first 10 lines to set the display name (otherwise the filename is used)
+3. Add a `# PLATFORM: brick` or `# PLATFORM: smartpro` line to target the correct device (defaults to `brick` if omitted)
+4. The script must write all LED positions in every frame to avoid stale colors bleeding through
+5. Use PID file management so the app can detect and stop your animation
 
-**LED positions in frame_hex (space-separated hex colors):**
+**Brick LED positions in frame_hex (14 LEDs, space-separated hex colors):**
 
 ```
 Position:  1    2    3    4    5    6    7    8    9    10   11   12   13   14
 Zone:      |---------- Top Bar (8) ----------|  F2   F1   |-- L Trig --|-- R Trig --|
 ```
 
-All 14 positions must be written in every frame, even if unused (set unused positions to `000000`).
+**Smart Pro LED positions in frame_hex (23 LEDs, space-separated hex colors):**
+
+```
+Position:  1      2-12                  13-23
+Zone:      Logo   |-- Left Ring (11) --|-- Right Ring (11) --|
+```
+
+> **Note:** The Smart Pro logo LED uses GRB byte order instead of RGB.
+
+All positions must be written in every frame, even if unused (set unused positions to `000000`).
 
 **Template:**
 
 ```sh
 #!/bin/sh
 # NAME: My Animation
+# PLATFORM: brick
 # Description of what it does
 #
 # Daemon-ready: writes PID to /tmp/led_anim.pid for external management
@@ -245,7 +269,7 @@ The binary is cross-compiled using the `ghcr.io/loveretro/tg5040-toolchain` Dock
 
 ## Hardware Research
 
-See [trimui_brick_led_research.md](trimui_brick_led_research.md) for per-LED framebuffer findings on the TrimUI Brick (14 individually addressable LEDs via `frame_hex`).
+See [trimui_brick_led_research.md](trimui_brick_led_research.md) for per-LED framebuffer findings on the TrimUI Brick (14 individually addressable LEDs via `frame_hex`). The Smart Pro uses the same `frame_hex` interface with 23 LEDs: 1 logo + 11 left ring + 11 right ring.
 
 ## Credits
 

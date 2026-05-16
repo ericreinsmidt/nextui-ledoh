@@ -1,5 +1,6 @@
 #!/bin/sh
 # NAME: Binary
+# PLATFORM: brick
 # Binary Counter — TrimUI Brick per-LED animation
 # 8 top bar LEDs represent 8 bits counting from 0 to 255
 # Bright = 1, dark = 0. Counts up, resets, repeat.

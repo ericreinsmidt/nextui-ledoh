@@ -1,5 +1,6 @@
 #!/bin/sh
 # NAME: Kessel Run
+# PLATFORM: brick
 # Jump to lightspeed — stars streak outward from center
 # Streaks originate from center of top bar and race to edges
 # Triggers sweep outward as streaks reach the bar edges

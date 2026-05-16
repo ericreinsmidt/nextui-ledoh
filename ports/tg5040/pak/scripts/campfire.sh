@@ -1,5 +1,6 @@
 #!/bin/sh
 # NAME: Campfire
+# PLATFORM: brick
 # Campfire — TrimUI Brick per-LED animation
 # Flickering warm fire on the top bar — reds, oranges, ambers, yellow tips
 # Triggers glow steady amber like embers

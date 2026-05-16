@@ -1,5 +1,6 @@
 #!/bin/sh
 # NAME: Aurora
+# PLATFORM: brick
 # Aurora Borealis — TrimUI Brick per-LED animation
 # Slow-drifting greens, teals, and purples across the top bar
 # Triggers glow soft green like distant ground light
