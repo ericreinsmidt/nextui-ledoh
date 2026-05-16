@@ -28,7 +28,7 @@
  * Constants
  * ----------------------------------------------------------------------- */
 
-#define LEDOH_VERSION    "0.5.0"
+#define LEDOH_VERSION    "0.7.0"
 #define MAX_PATH_LEN     1280
 #define MAX_ZONES        4
 #define MAX_LINE         512
@@ -153,6 +153,7 @@ typedef struct {
 typedef struct {
     char name[64];          /* Display name parsed from "# NAME:" header */
     char script[64];        /* Script filename: "aurora.sh" */
+    char platform[32];      /* Target platform from "# PLATFORM:" header */
 } anim_def_t;
 
 /* LED operating mode */
@@ -210,6 +211,7 @@ static const zone_def_t g_smartpro_zones[SP_ZONE_COUNT] = {
  * ----------------------------------------------------------------------- */
 
 static int           g_is_brick     = 1;
+static char          g_platform[32] = "brick"; /* "brick", "smartpro", "smartpro_s" */
 static int           g_zone_count   = MAX_ZONES;
 static const zone_def_t *g_zones    = g_brick_zones;
 
@@ -433,10 +435,11 @@ static void anim_scan_scripts(void) {
         snprintf(script_path, sizeof(script_path), "%s/%s", scripts_dir, fname);
 
         char display_name[64] = {0};
+        char script_platform[32] = {0};
         FILE *f = fopen(script_path, "r");
         if (f) {
             char line[256];
-            for (int i = 0; i < 5 && fgets(line, sizeof(line), f); i++) {
+            for (int i = 0; i < 10 && fgets(line, sizeof(line), f); i++) {
                 /* Look for "# NAME: <display name>" */
                 if (strncmp(line, "# NAME:", 7) == 0) {
                     char *name_start = line + 7;
@@ -448,10 +451,31 @@ static void anim_scan_scripts(void) {
                            display_name[nlen-1] == '\r' ||
                            display_name[nlen-1] == ' '))
                         display_name[--nlen] = '\0';
-                    break;
+                }
+                /* Look for "# PLATFORM: <platform>" */
+                if (strncmp(line, "# PLATFORM:", 11) == 0) {
+                    char *plat_start = line + 11;
+                    while (*plat_start == ' ') plat_start++;
+                    snprintf(script_platform, sizeof(script_platform), "%s", plat_start);
+                    size_t plen = strlen(script_platform);
+                    while (plen > 0 && (script_platform[plen-1] == '\n' ||
+                           script_platform[plen-1] == '\r' ||
+                           script_platform[plen-1] == ' '))
+                        script_platform[--plen] = '\0';
                 }
             }
             fclose(f);
+        }
+
+        /* Default platform is "brick" for backward compatibility */
+        if (script_platform[0] == '\0')
+            snprintf(script_platform, sizeof(script_platform), "brick");
+
+        /* Skip scripts that don't match the current platform */
+        if (strcmp(script_platform, g_platform) != 0) {
+            ap_log("ANIM SCAN: skipping %s (platform=%s, current=%s)",
+                   fname, script_platform, g_platform);
+            continue;
         }
 
         /* Fall back to filename without .sh extension */
@@ -466,6 +490,7 @@ static void anim_scan_scripts(void) {
         anim_def_t *anim = &g_animations[g_anim_count];
         snprintf(anim->script, sizeof(anim->script), "%s", fname);
         snprintf(anim->name, sizeof(anim->name), "%s", display_name);
+        snprintf(anim->platform, sizeof(anim->platform), "%s", script_platform);
         g_anim_count++;
 
         ap_log("ANIM SCAN: found %s → \"%s\"", fname, display_name);
@@ -631,7 +656,7 @@ static void anim_start(int anim_idx) {
 /* Pause animation for editing — returns the animation index that was running,
  * or -1 if none was running.  Pass the return value to anim_resume_after_editing(). */
 static int anim_pause_for_editing(void) {
-    if (!g_is_brick) return -1;
+    if (g_anim_count == 0) return -1;
     if (g_led_mode != MODE_ANIMATION) return -1;
     if (!anim_is_running()) return -1;
 
@@ -650,7 +675,7 @@ static int anim_pause_for_editing(void) {
 
 /* Resume animation after editing */
 static void anim_resume_after_editing(int anim_idx) {
-    if (!g_is_brick) return;
+    if (g_anim_count == 0) return;
     if (anim_idx < 0) return;
 
     ap_log("ANIM: resuming %s after editing", g_animations[anim_idx].name);
@@ -1822,13 +1847,8 @@ static void show_color_picker(int zone_idx) {
                 if (hat & SDL_HAT_UP)    dy -= speed;
                 if (hat & SDL_HAT_DOWN)  dy += speed;
             }
-            /* Also check analog stick with deadzone */
-            Sint16 ax = SDL_JoystickGetAxis(joy, 0);
-            Sint16 ay = SDL_JoystickGetAxis(joy, 1);
-            if (ax < -8000) dx -= speed;
-            if (ax >  8000) dx += speed;
-            if (ay < -8000) dy -= speed;
-            if (ay >  8000) dy += speed;
+            /* Analog stick disabled in color picker — d-pad hat is sufficient
+             * and avoids stick drift issues on some devices */
         }
 
         /* Keyboard fallback for dev mode */
@@ -2130,7 +2150,7 @@ static void leds_on(void) {
     /* Re-enable effect system first */
     sysfs_write_int("/sys/class/led_anim/effect_enable", 1);
 
-    if (g_is_brick && g_anim_idx >= 0 && g_anim_idx < g_anim_count) {
+    if (g_anim_count > 0 && g_anim_idx >= 0 && g_anim_idx < g_anim_count) {
         /* Restore brightness before animation takes over */
         for (int i = 0; i < g_zone_count; i++)
             led_write_brightness(g_zones[i].filename, g_zone_state[i].brightness);
@@ -2151,7 +2171,7 @@ static void leds_on(void) {
  * ----------------------------------------------------------------------- */
 
 static void show_menu(void) {
-    int has_anims = g_is_brick && g_anim_count > 0;
+    int has_anims = g_anim_count > 0;
     int anim_active = has_anims && (g_led_mode == MODE_ANIMATION);
     char zone_settings_label[128];
     snprintf(zone_settings_label, sizeof(zone_settings_label), "%s Settings", g_zones[g_selected_zone].name);
@@ -2449,6 +2469,7 @@ int main(int argc, char *argv[]) {
     ap_log("STARTUP: DEVICE env = %s", device ? device : "(null)");
     if (device && strcmp(device, "brick") == 0) {
         g_is_brick = 1;
+        snprintf(g_platform, sizeof(g_platform), "brick");
         g_zones = g_brick_zones;
         g_zone_count = MAX_ZONES;
         g_dev_img_w = BRICK_IMG_W;
@@ -2459,6 +2480,7 @@ int main(int argc, char *argv[]) {
                  "/mnt/SDCARD/.userdata/shared/ledoh_state_brick.txt");
     } else {
         g_is_brick = 0;
+        snprintf(g_platform, sizeof(g_platform), "smartpro");
         g_zones = g_smartpro_zones;
         g_zone_count = SP_ZONE_COUNT;
         g_dev_img_w = SP_IMG_W;
@@ -2468,13 +2490,12 @@ int main(int argc, char *argv[]) {
         snprintf(g_state_path, sizeof(g_state_path),
                  "/mnt/SDCARD/.userdata/shared/ledoh_state.txt");
     }
-    ap_log("STARTUP: is_brick = %d, zone_count = %d", g_is_brick, g_zone_count);
+    ap_log("STARTUP: platform = %s, is_brick = %d, zone_count = %d", g_platform, g_is_brick, g_zone_count);
     ap_log("STARTUP: settings path = %s", g_settings_path);
     ap_log("STARTUP: state path = %s", g_state_path);
 
-    /* Discover animation scripts (Brick only) */
-    if (g_is_brick)
-        anim_scan_scripts();
+    /* Discover animation scripts for current platform */
+    anim_scan_scripts();
 
     /* Load device images */
     load_device_images();
@@ -2489,7 +2510,7 @@ int main(int argc, char *argv[]) {
     /* Act on the loaded mode */
     switch (g_led_mode) {
         case MODE_ANIMATION:
-            if (g_is_brick && g_anim_idx >= 0) {
+            if (g_anim_count > 0 && g_anim_idx >= 0) {
                 if (!anim_is_running()) {
                     ap_log("STARTUP: auto-launching saved animation: %s",
                            g_animations[g_anim_idx].name);

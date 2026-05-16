@@ -1,5 +1,6 @@
 #!/bin/sh
 # NAME: Ocean
+# PLATFORM: brick
 # Ocean Waves — TrimUI Brick per-LED animation
 # Slow drifting blue/teal/cyan gradient across the top bar
 # Triggers hold deep ocean blue, F1/F2 pick up seafoam
